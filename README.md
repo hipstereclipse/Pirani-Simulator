@@ -1,144 +1,122 @@
 # Pirani Vacuum Gauge Simulator
 
-**Based on:** Jousten (2008) "On the gas species dependence of Pirani vacuum gauges"  
-*J. Vac. Sci. Technol. A 26, 352–359*
+Interactive Python desktop application for understanding and exploring Pirani gauge behavior across gas species, pressure regimes, and gauge geometries.
 
-A comprehensive Python desktop application for understanding Pirani gauge physics, 
-simulating gas-dependent heat transfer, and exploring the experimental results from the paper.
+This project combines:
+- educational visualization of Pirani physics,
+- interactive parametric simulation,
+- comparison to published correction-factor data,
+- practical pressure-correction utilities.
 
----
+## What This Program Is
+
+This simulator is a physics-informed teaching and engineering exploration tool for thermal-conductivity vacuum gauging.
+
+It is not intended to replace factory calibration or metrology-grade uncertainty analysis. Instead, it helps answer questions such as:
+- Why does a Pirani reading depend on gas species?
+- How do geometry and accommodation coefficient change sensitivity?
+- Where does molecular behavior transition toward viscous behavior?
+- How does calibration error evolve over pressure?
+
+## What It Includes
+
+- Gas data explorer for supported species (mass, degrees of freedom, mean molecular speed, and related properties)
+- 2D pressure-response simulation with molecular and viscous contribution breakdown
+- 3D parameter sweeps for pressure, temperature, geometry, and accommodation
+- Correction factor views (including theory vs. experimental comparison)
+- Accommodation coefficient exploration for tungsten and silicon references
+- Utility calculator for indicated-to-true pressure correction
+
+## How It Works
+
+At a high level, the app models heat transfer from the heated sensing element to gas as pressure-dependent thermal coupling.
+
+Core concepts used by the simulator:
+
+1. Molecular regime term (low pressure, free-molecule transport dominant)
+2. Continuum/viscous contribution (higher pressure, collisional transport increases)
+3. Smooth bridging expression to combine regimes over a wide pressure range
+4. Gas-specific correction behavior relative to nitrogen calibration
+
+The implementation uses tabulated gas properties, configurable geometry, and accommodation-ratio scaling to estimate relative behavior and correction trends.
+
+## Physics Model Summary
+
+Representative relations used in the app include:
+
+$$
+\dot{Q}_{\mathrm{mol}} \propto a_E\,\frac{f+1}{8}\,\bar{c}\,A\,\frac{T_1-T_2}{T_x}\,p
+$$
+
+and a pressure-bridged form:
+
+$$
+\dot{Q}_{\mathrm{gas}} = \frac{\alpha p}{1 + g p}
+$$
+
+Correction-factor framing (for gas $X$ vs. nitrogen-calibrated reading):
+
+$$
+CF_{X/N_2} = \frac{p_{\mathrm{true}}}{p_{\mathrm{indicated}}}
+$$
+
+The exact simulator implementation includes additional practical terms and tuning constants to keep behavior physically anchored across a wide range while still matching expected qualitative trends.
 
 ## Quick Start
 
+1. Install dependencies:
+
 ```bash
-# 1. Install dependencies (if needed)
-pip install matplotlib numpy
+pip install -r requirements.txt
+```
 
-# 2. Run the launcher (checks everything automatically)
+2. Run with launcher (recommended):
+
+```bash
 python run_pirani.py
+```
 
-# OR run the simulator directly
+3. Or run directly:
+
+```bash
 python pirani_simulator.py
 ```
 
-### Requirements
-- **Python 3.8+**
-- **tkinter** (usually included with Python — see Troubleshooting below)
-- **matplotlib** ≥ 3.5
-- **numpy** ≥ 1.21
+## Requirements
 
----
+- Python 3.8+
+- tkinter (usually bundled with Python installers)
+- numpy
+- matplotlib
 
-## Application Tabs
+## Repository Structure
 
-### 💡 How It Works
-Educational walkthrough of Pirani gauge physics: energy balance, molecular vs. viscous 
-regimes, the combined formula, and why gas species matters.
+- pirani_simulator.py: Main GUI application and simulation logic
+- run_pirani.py: Lightweight launcher and startup checks
+- requirements.txt: Python dependencies
+- README.md: Project overview and usage
+- docs/SOURCES.md: Source list and data provenance notes
 
-### 🧪 Gas Explorer
-Interactive comparison of all nine gas species from Table I. Sort by molecular mass, 
-degrees of freedom, mean velocity, p·λ̄ product, or heat capacity ratio.
+## Data, Sources, and Provenance
 
-### 📐 Gauge Geometry
-2D cross-section and 3D visualization of two gauge configurations:
-- **Wire-in-cylinder** (conventional, VM1/VM2/VM4 from the paper)
-- **MEMS parallel plate** (VM3 from the paper)
+The primary scientific basis for the gas-species dependence treatment is:
 
-Adjust pressure to see Knudsen number change and flow regime transitions.
+- K. Jousten, "On the gas species dependence of Pirani vacuum gauges," J. Vac. Sci. Technol. A 26, 352-359 (2008), https://doi.org/10.1116/1.2897314
 
-### 📈 2D Simulator
-The core simulation tool. Plot heat transfer Q̇_gas vs. pressure for any combination of gases.
+Additional constants and engineering assumptions in the code are documented as implementation choices to support simulation stability and educational visualization. See docs/SOURCES.md for a structured source/provenance breakdown.
 
-Controls:
-- Select any combination of 9 gas species
-- Choose gauge configuration (conventional, MEMS, custom wire, custom plate)
-- Adjust wire temperature, enclosure temperature, accommodation coefficient
-- Adjust wire radius, wire length, enclosure radius
-- Toggle log/linear scale
-- Show molecular vs. viscous regime breakdown
-- Show total electrical power including p₀ offset
+## Limitations
 
-### 🌐 3D Simulator
-Interactive 3D surface plots exploring multi-parameter dependencies:
-
-1. **Pressure × Accommodation → Q**: See how heat flow depends on both pressure and accommodation coefficient
-2. **Pressure × Wire Temp → Q**: Effect of wire temperature on the calibration curve
-3. **Pressure × Gap Size → Q**: How geometry affects sensitivity and range
-4. **Gas Species × Pressure → CF**: All correction factors evolving with pressure
-5. **Molecular vs Viscous (3D)**: Compare regime contributions in a 3D breakdown
-
-All 3D plots support mouse rotation, zoom, and multiple colormaps.
-
-### 🔧 Correction Factors
-Four visualization modes for the paper's experimental correction factor data:
-
-1. **Bar Chart**: Mean correction factors with error bars and MEMS comparison
-2. **True vs Indicated** (Fig. 4): The classic log-log calibration view
-3. **Theory vs Experiment**: Scatter plot comparing Eq. 11 predictions to data
-4. **Spread**: Gauge-to-gauge variation as horizontal range bars
-
-### ⚛ Accommodation
-Explore accommodation coefficients on tungsten and silicon surfaces (Tables VII & VIII).
-Adjust the reference a_N₂ and see how all absolute coefficients scale. The visualization 
-highlights unphysical values (> 1).
-
-### 🧮 Calculator
-Practical calculation tools:
-- **Pressure Correction**: Convert indicated → true pressure for any gas
-- **Heat Transfer**: Calculate molecular, viscous, and combined heat flow
-- **Quick Reference**: All correction factors at a glance
-
----
-
-## Key Physics
-
-The fundamental equation for gas heat transfer in the molecular regime:
-
-    Q̇_gas,mol = aE · (f+1)/8 · c̄ · A · (T₁−T₂)/Tx · p
-
-Combined molecular + viscous (Eq. 9):
-
-    Q̇_gas = αp / (1 + gp)
-
-Normalized correction factor:
-
-    CF_X/N₂ = p_cal / p_ind  (for gas species X, calibrated on N₂)
-
----
+- This is a simulator, not a traceable calibration system.
+- Results depend on model assumptions and selected gauge configuration presets.
+- Absolute accuracy at extremes should be treated cautiously; relative trend analysis is the primary use case.
 
 ## Troubleshooting
 
-### "No module named 'tkinter'"
-tkinter comes pre-installed with most Python distributions. If missing:
-- **Ubuntu/Debian**: `sudo apt-get install python3-tk`
-- **Fedora/RHEL**: `sudo dnf install python3-tkinter`
-- **macOS**: `brew install python-tk@3.12` (or reinstall from python.org)
-- **Windows**: Reinstall Python, ensuring "tcl/tk and IDLE" is checked
+If tkinter is unavailable on your platform, install the platform package for Tk support and rerun.
 
-### Plots look strange or don't update
-Try resizing the window. If using a HiDPI display, matplotlib should scale 
-automatically. You can also set `matplotlib.rcParams['figure.dpi'] = 150` in 
-the script.
+- Ubuntu/Debian: sudo apt-get install python3-tk
+- Fedora/RHEL: sudo dnf install python3-tkinter
+- Windows: reinstall Python with Tcl/Tk selected
 
-### 3D plots are slow to rotate
-Reduce the number of data points by adjusting parameters. The 3D surface 
-plots use 50×50 grids by default.
-
----
-
-## File Structure
-
-```
-pirani_simulator.py   — Main application (all code in one file)
-run_pirani.py         — Launcher with dependency checking
-requirements.txt      — Python package dependencies
-README.md             — This file
-```
-
----
-
-## Reference
-
-K. Jousten, "On the gas species dependence of Pirani vacuum gauges,"
-J. Vac. Sci. Technol. A 26, 352–359 (2008).
-https://doi.org/10.1116/1.2897314
+If plots render slowly, reduce simulation resolution or simplify 3D sweeps.
