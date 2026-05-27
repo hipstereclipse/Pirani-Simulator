@@ -9,7 +9,10 @@ gas-dependent heat transfer, correction factors, and accommodation coefficients.
 """
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
+import csv
+import io
+import json
 import numpy as np
 import matplotlib
 matplotlib.use('TkAgg')
@@ -20,11 +23,19 @@ from mpl_toolkits.mplot3d import Axes3D
 from mpl_toolkits.mplot3d import art3d
 from matplotlib import cm
 import matplotlib.colors as mcolors
+import os
+import re
 import sys
 import math
 import time
 import traceback
+import html as html_lib
+import webbrowser
 from collections import deque
+from html.parser import HTMLParser
+from urllib import error as urlerror
+from urllib import parse as urlparse
+from urllib import request as urlrequest
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  PHYSICS DATA FROM THE PAPER
@@ -38,7 +49,7 @@ AMU_TO_KG = 1.66053906660e-27
 
 # Keep continuum term physically anchored; avoid empirical gain inflation.
 VISCOUS_GAIN = 1.0
-GRAVITY_Z_CONVECTION_GAIN = 0.22
+DEFAULT_CONVECTION_GAIN = 0.22
 
 # Approximate gas transport properties near 300 K for natural-convection scaling.
 # mu0: dynamic viscosity (Pa·s), k0: thermal conductivity (W/m/K).
@@ -85,6 +96,625 @@ EXPERIMENTAL_CF = {
 # Accommodation coefficient ratios (Tables VII & VIII)
 ACCOM_RATIOS_W = {'H2': 0.46, 'He': 0.57, 'Ne': 0.93, 'CO': 1.02, 'N2': 1.00, 'O2': 1.01, 'Ar': 1.08, 'CO2': 1.12, 'Kr': 1.14, 'Xe': 1.16}
 ACCOM_RATIOS_Si = {'H2': 0.37, 'He': 0.48, 'Ne': 0.89, 'CO': 1.03, 'N2': 1.00, 'O2': 1.02, 'Ar': 1.19, 'CO2': 1.17, 'Kr': 1.28, 'Xe': 1.31}
+
+DEFAULT_GAS_KEYS = tuple(GAS_DATA.keys())
+CUSTOM_GAS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'custom_gases.json')
+NIST_WEBBOOK_URL = 'https://webbook.nist.gov/cgi/cbook.cgi'
+PUBCHEM_PUG_URL = 'https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name'
+PUBCHEM_COMPOUND_URL = 'https://pubchem.ncbi.nlm.nih.gov/compound'
+IAEA_LIVECHART_URL = 'https://nds.iaea.org/relnsd/v1/data'
+
+CUSTOM_GAS_STATE = {
+    'palette': list(DEFAULT_GAS_KEYS),
+    'gases': {},
+}
+GAS_PALETTE_LISTENERS = []
+
+KINETIC_DIAMETER_PM = {
+    'H2': 289.0, 'He': 260.0, 'Ne': 275.0, 'CO': 376.0, 'N2': 364.0,
+    'O2': 346.0, 'Ar': 340.0, 'CO2': 330.0, 'Kr': 360.0, 'Xe': 396.0,
+    'H2O': 265.0, 'CH4': 380.0, 'NH3': 260.0, 'SF6': 550.0,
+    'D2': 289.0, 'T2': 289.0,
+}
+
+DOF_OVERRIDES = {
+    'H2': 5, 'N2': 5, 'O2': 5, 'CO': 5,
+    'CO2': 6, 'H2O': 6, 'CH4': 6, 'NH3': 6, 'SF6': 6,
+    'D2': 5, 'T2': 5,
+}
+
+QUICK_NIST_GAS_NAMES = [
+    'Hydrogen', 'Helium', 'Nitrogen', 'Oxygen', 'Argon', 'Carbon dioxide',
+    'Carbon monoxide', 'Neon', 'Krypton', 'Xenon', 'Methane', 'Water',
+    'Ammonia', 'Sulfur hexafluoride', 'Chlorine', 'Nitrous oxide',
+    'Tritium', 'Molecular tritium', 'Deuterium',
+]
+
+IAEA_ISOTOPE_GAS_LOOKUP = {
+    'tritium': {'nuclide': '3H', 'formula': 'T2', 'name': 'Tritium gas'},
+    'molecular tritium': {'nuclide': '3H', 'formula': 'T2', 'name': 'Tritium gas'},
+    'deuterium': {'nuclide': '2H', 'formula': 'D2', 'name': 'Deuterium gas'},
+    'molecular deuterium': {'nuclide': '2H', 'formula': 'D2', 'name': 'Deuterium gas'},
+}
+
+
+def _gas_sources_text(gas):
+    sources = gas.get('sources') or {}
+    if isinstance(sources, dict):
+        return '; '.join(f'{k}: {v}' for k, v in sources.items())
+    return str(sources or gas.get('source', ''))
+
+
+def _gas_source_label(gas):
+    source = str(gas.get('provider') or gas.get('source') or '')
+    if 'PubChem' in source:
+        return 'PubChem'
+    if 'IAEA' in source:
+        return 'IAEA'
+    if 'NIST' in source or gas.get('nist_id'):
+        return 'NIST'
+    return 'Default'
+
+
+for _gas_key, _gas in GAS_DATA.items():
+    _gas.setdefault('nist_id', None)
+    _gas.setdefault('source', 'Jousten 2008 and simulator transport defaults')
+    _gas.setdefault('sources', {
+        'm': 'Jousten 2008 Table I / standard molecular weights',
+        'f': 'Jousten 2008 Table I',
+        'gamma': 'Jousten 2008 Table I / ideal-gas estimate',
+        'cbar': 'Jousten 2008 Table I / kinetic-theory reference',
+        'plbar': 'Jousten 2008 Table I',
+        'transport': 'Room-temperature engineering values used for convection scaling',
+    })
+
+
+def _formula_atom_count(formula):
+    counts = re.findall(r'([A-Z][a-z]?)(\d*)', formula or '')
+    total = 0
+    for _, count in counts:
+        total += int(count) if count else 1
+    return total
+
+
+def _estimate_degrees_of_freedom(formula):
+    clean = re.sub(r'[^A-Za-z0-9]', '', formula or '')
+    if clean in DOF_OVERRIDES:
+        return DOF_OVERRIDES[clean]
+    atom_count = _formula_atom_count(clean)
+    if atom_count <= 1:
+        return 3
+    if atom_count == 2:
+        return 5
+    return 6
+
+
+def _estimate_molecular_radius_pm(gas_key):
+    if gas_key in KINETIC_DIAMETER_PM:
+        return KINETIC_DIAMETER_PM[gas_key]
+    gas = GAS_DATA.get(gas_key, {})
+    formula = re.sub(r'[^A-Za-z0-9]', '', str(gas.get('formula', gas_key)))
+    if formula in KINETIC_DIAMETER_PM:
+        return KINETIC_DIAMETER_PM[formula]
+    mass = max(float(gas.get('m', GAS_DATA['N2']['m'])), 1.0)
+    return float(np.clip(255.0 + 22.0 * (mass ** (1.0 / 3.0)), 240.0, 620.0))
+
+
+def _estimate_plbar(gas_key):
+    diameter = max(_estimate_molecular_radius_pm(gas_key), 1.0)
+    return GAS_DATA['N2']['plbar'] * (KINETIC_DIAMETER_PM['N2'] / diameter) ** 2
+
+
+def _estimate_transport_for_gas(gas_key, gas):
+    mass = max(float(gas.get('m', GAS_DATA['N2']['m'])), 1.0)
+    diameter = max(_estimate_molecular_radius_pm(gas_key), 1.0)
+    n2_mass = GAS_DATA['N2']['m']
+    n2_diameter = KINETIC_DIAMETER_PM['N2']
+    mu = GAS_TRANSPORT['N2']['mu0'] * math.sqrt(mass / n2_mass) * (n2_diameter / diameter) ** 2
+    f = max(float(gas.get('f', 5)), 3.0)
+    k = GAS_TRANSPORT['N2']['k0'] * math.sqrt(n2_mass / mass) * (f / 5.0) * (n2_diameter / diameter) ** 2
+    return {'mu0': float(np.clip(mu, 4e-6, 70e-6)), 'k0': float(np.clip(k, 0.003, 0.25))}
+
+
+def _estimate_transport(gas_key):
+    return _estimate_transport_for_gas(gas_key, GAS_DATA.get(gas_key, GAS_DATA['N2']))
+
+
+def _format_formula_symbol(formula):
+    sub = str.maketrans('0123456789', '0123456789')
+    if not formula:
+        return ''
+    # Keep ASCII symbols for imported gases so persisted JSON remains simple.
+    return str(formula).translate(sub)
+
+
+def _mean_speed_from_mass(mass_amu, temperature_k=296.0):
+    mass_kg = max(float(mass_amu), 1e-12) * AMU_TO_KG
+    return math.sqrt((8.0 * kB * float(temperature_k)) / (math.pi * mass_kg))
+
+
+def _deterministic_gas_color(key):
+    palette = ['#e74c3c', '#3498db', '#2ecc71', '#f39c12', '#9b59b6', '#1abc9c',
+               '#e67e22', '#34495e', '#d35400', '#16a085', '#c0392b', '#2980b9']
+    idx = sum(ord(ch) for ch in str(key)) % len(palette)
+    return palette[idx]
+
+
+def _canonical_gas_key(name, formula, nist_id=None):
+    base = re.sub(r'[^A-Za-z0-9]', '', formula or '')
+    if not base:
+        base = re.sub(r'[^A-Za-z0-9]+', '_', name or '').strip('_')[:18]
+    if not base:
+        base = f'NIST_{nist_id or len(GAS_DATA) + 1}'
+    if base not in GAS_DATA:
+        return base
+    current = GAS_DATA.get(base, {})
+    if nist_id and current.get('nist_id') == nist_id:
+        return base
+    slug = re.sub(r'[^A-Za-z0-9]+', '_', name or base).strip('_')[:18]
+    candidate = slug or base
+    if candidate not in GAS_DATA:
+        return candidate
+    idx = 2
+    while f'{candidate}_{idx}' in GAS_DATA:
+        idx += 1
+    return f'{candidate}_{idx}'
+
+
+def _normalize_imported_formula(name, formula, mass_amu=None):
+    clean = re.sub(r'[^A-Za-z0-9]', '', formula or '')
+    low = f'{name or ""} {clean}'.lower()
+    mass = float(mass_amu) if mass_amu is not None else 0.0
+    if 'tritium' in low:
+        return 'T2' if mass >= 5.0 or clean in ('H2', 'T2') else 'T'
+    if 'deuterium' in low:
+        return 'D2' if mass >= 3.5 or clean in ('H2', 'D2') else 'D'
+    return clean
+
+
+def _register_simulation_gas(key, gas, transport=None, custom=True):
+    if not key or not isinstance(gas, dict):
+        return None
+    clean_key = str(key)
+    GAS_DATA[clean_key] = gas
+    GAS_DATA[clean_key].setdefault('color', _deterministic_gas_color(clean_key))
+    GAS_DATA[clean_key].setdefault('symbol', clean_key)
+    GAS_DATA[clean_key].setdefault('name', clean_key)
+    GAS_DATA[clean_key].setdefault('f', _estimate_degrees_of_freedom(GAS_DATA[clean_key].get('formula', clean_key)))
+    GAS_DATA[clean_key].setdefault('gamma', round((GAS_DATA[clean_key]['f'] + 2.0) / GAS_DATA[clean_key]['f'], 2))
+    GAS_DATA[clean_key].setdefault('cbar', int(round(_mean_speed_from_mass(GAS_DATA[clean_key].get('m', GAS_DATA['N2']['m'])))))
+    GAS_DATA[clean_key].setdefault('plbar', _estimate_plbar(clean_key))
+    GAS_TRANSPORT[clean_key] = transport or GAS_TRANSPORT.get(clean_key) or _estimate_transport(clean_key)
+    ACCOM_RATIOS_W.setdefault(clean_key, 1.0)
+    ACCOM_RATIOS_Si.setdefault(clean_key, 1.0)
+    if custom:
+        CUSTOM_GAS_STATE.setdefault('gases', {})[clean_key] = {
+            'gas': GAS_DATA[clean_key],
+            'transport': GAS_TRANSPORT[clean_key],
+        }
+    return clean_key
+
+
+def _load_custom_gases():
+    if not os.path.exists(CUSTOM_GAS_FILE):
+        return
+    try:
+        with open(CUSTOM_GAS_FILE, 'r', encoding='utf-8') as fh:
+            payload = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return
+
+    palette = payload.get('palette', [])
+    gases = payload.get('gases', {})
+    CUSTOM_GAS_STATE['palette'] = [k for k in palette if isinstance(k, str)] or list(DEFAULT_GAS_KEYS)
+    CUSTOM_GAS_STATE['gases'] = {}
+    for key, entry in gases.items():
+        if not isinstance(entry, dict):
+            continue
+        gas = entry.get('gas', entry)
+        transport = entry.get('transport')
+        if isinstance(gas, dict):
+            _register_simulation_gas(key, gas, transport=transport, custom=True)
+
+    CUSTOM_GAS_STATE['palette'] = [k for k in CUSTOM_GAS_STATE['palette'] if k in GAS_DATA]
+    if not CUSTOM_GAS_STATE['palette']:
+        CUSTOM_GAS_STATE['palette'] = list(DEFAULT_GAS_KEYS)
+
+
+def save_custom_gases():
+    payload = {
+        'palette': [k for k in CUSTOM_GAS_STATE.get('palette', []) if k in GAS_DATA],
+        'gases': CUSTOM_GAS_STATE.get('gases', {}),
+    }
+    try:
+        with open(CUSTOM_GAS_FILE, 'w', encoding='utf-8') as fh:
+            json.dump(payload, fh, indent=2, sort_keys=True)
+    except OSError as exc:
+        messagebox.showwarning('Gas Palette', f'Could not save custom gas palette:\n{exc}')
+
+
+def get_gas_palette_keys(mode='default'):
+    if mode == 'custom':
+        keys = [k for k in CUSTOM_GAS_STATE.get('palette', []) if k in GAS_DATA]
+        return keys or list(DEFAULT_GAS_KEYS)
+    return [k for k in DEFAULT_GAS_KEYS if k in GAS_DATA]
+
+
+def get_all_simulation_gas_keys():
+    return list(GAS_DATA.keys())
+
+
+def _gas_combo_label(key):
+    gas = GAS_DATA[key]
+    return f"{gas.get('symbol', key)} ({key})"
+
+
+def _gas_key_from_combo(value, fallback='N2'):
+    val = str(value or '')
+    m = re.search(r'\(([^)]+)\)\s*$', val)
+    if m and m.group(1) in GAS_DATA:
+        return m.group(1)
+    if val in GAS_DATA:
+        return val
+    for key in GAS_DATA:
+        if val.startswith(f"{GAS_DATA[key].get('symbol', key)} "):
+            return key
+    return fallback if fallback in GAS_DATA else next(iter(GAS_DATA))
+
+
+def register_gas_palette_listener(callback):
+    if callable(callback) and callback not in GAS_PALETTE_LISTENERS:
+        GAS_PALETTE_LISTENERS.append(callback)
+
+
+def notify_gas_palette_changed():
+    for callback in list(GAS_PALETTE_LISTENERS):
+        try:
+            callback()
+        except Exception:
+            traceback.print_exc()
+
+
+class _NISTSearchParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.results = []
+        self._href = None
+        self._text = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() != 'a':
+            return
+        attrs = dict(attrs)
+        href = attrs.get('href', '')
+        if 'cbook.cgi' in href and ('ID=' in href or 'Name=' in href):
+            self._href = href
+            self._text = []
+
+    def handle_data(self, data):
+        if self._href is not None:
+            self._text.append(data)
+
+    def handle_endtag(self, tag):
+        if tag.lower() != 'a' or self._href is None:
+            return
+        name = html_lib.unescape(''.join(self._text)).strip()
+        href = html_lib.unescape(self._href)
+        self._href = None
+        self._text = []
+        if not name or name.lower() in ('nist chemistry webbook', 'main site page'):
+            return
+        parsed = urlparse.urlparse(href)
+        qs = urlparse.parse_qs(parsed.query)
+        nist_id = (qs.get('ID') or [''])[0]
+        if not nist_id:
+            return
+        if any(r.get('nist_id') == nist_id for r in self.results):
+            return
+        url = href if href.startswith('http') else urlparse.urljoin(NIST_WEBBOOK_URL, href)
+        self.results.append({
+            'name': name,
+            'provider': 'NIST',
+            'provider_id': nist_id,
+            'nist_id': nist_id,
+            'url': url,
+        })
+
+
+class _TextExtractor(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+
+    def handle_data(self, data):
+        if data and data.strip():
+            self.parts.append(data.strip())
+
+    def text(self):
+        return '\n'.join(self.parts)
+
+
+def _fetch_url(url, timeout=12):
+    req = urlrequest.Request(url, headers={'User-Agent': 'Mozilla/5.0 PiraniSimulator/1.0'})
+    with urlrequest.urlopen(req, timeout=timeout) as resp:
+        charset = resp.headers.get_content_charset() or 'utf-8'
+        return resp.read().decode(charset, errors='replace')
+
+
+def _nist_search_url(query):
+    return NIST_WEBBOOK_URL + '?' + urlparse.urlencode({'Name': query, 'Units': 'SI'})
+
+
+def search_nist_gases(query, limit=30):
+    html = _fetch_url(_nist_search_url(query))
+    parser = _NISTSearchParser()
+    parser.feed(html)
+    results = parser.results[:limit]
+    if results:
+        return results
+    detail = parse_nist_species_page(html, _nist_search_url(query))
+    if detail:
+        return [{
+            'name': detail['name'],
+            'provider': 'NIST',
+            'provider_id': detail.get('nist_id', ''),
+            'nist_id': detail.get('nist_id', ''),
+            'url': detail['source_url'],
+            'detail': detail,
+        }]
+    return []
+
+
+def parse_nist_species_page(html, source_url):
+    text_parser = _TextExtractor()
+    text_parser.feed(html)
+    text = text_parser.text()
+    h1_match = re.search(r'<h1[^>]*>(.*?)</h1>', html, flags=re.I | re.S)
+    name = html_lib.unescape(re.sub(r'<.*?>', '', h1_match.group(1))).strip() if h1_match else ''
+    if not name:
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        name = lines[0] if lines else 'NIST gas'
+
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+    def value_after_label(label):
+        for idx, line in enumerate(lines):
+            if line.lower().startswith(label.lower()):
+                value = line.split(':', 1)[1].strip() if ':' in line else ''
+                if value:
+                    return value
+                if idx + 1 < len(lines):
+                    return lines[idx + 1].strip()
+        return ''
+
+    formula = re.sub(r'[^A-Za-z0-9]', '', value_after_label('Formula'))
+    mw_match = re.search(r'([0-9]+(?:\.[0-9]+)?)', value_after_label('Molecular weight'))
+    if mw_match is None:
+        return None
+    mass = float(mw_match.group(1))
+    cas_match = re.search(r'([0-9\-]+)', value_after_label('CAS Registry Number'))
+    parsed = urlparse.urlparse(source_url)
+    qs = urlparse.parse_qs(parsed.query)
+    nist_id = (qs.get('ID') or [''])[0]
+    return {
+        'name': name,
+        'formula': _normalize_imported_formula(name, formula, mass),
+        'm': mass,
+        'cas': cas_match.group(1) if cas_match else '',
+        'nist_id': nist_id,
+        'provider': 'NIST',
+        'provider_id': nist_id,
+        'source_url': source_url,
+        'source': 'NIST Chemistry WebBook',
+    }
+
+
+def fetch_nist_gas_detail(result):
+    if result.get('detail'):
+        return result['detail']
+    url = result.get('url')
+    if not url and result.get('nist_id'):
+        url = NIST_WEBBOOK_URL + '?' + urlparse.urlencode({'ID': result['nist_id'], 'Units': 'SI'})
+    if not url:
+        return None
+    html = _fetch_url(url)
+    return parse_nist_species_page(html, url)
+
+
+def _pubchem_property_url(query):
+    props = 'MolecularFormula,MolecularWeight,IUPACName,CanonicalSMILES'
+    return f"{PUBCHEM_PUG_URL}/{urlparse.quote(query)}/property/{props}/JSON"
+
+
+def fetch_pubchem_gas_detail_by_name(query):
+    url = _pubchem_property_url(query)
+    payload = json.loads(_fetch_url(url))
+    props = payload.get('PropertyTable', {}).get('Properties', [])
+    if not props:
+        return None
+    prop = props[0]
+    cid = prop.get('CID')
+    mass = float(prop.get('MolecularWeight'))
+    formula = _normalize_imported_formula(query, prop.get('MolecularFormula', ''), mass)
+    name = prop.get('IUPACName') or str(query).strip().title()
+    if formula == 'T2' and 'tritium' in str(query).lower():
+        name = 'Tritium gas'
+    elif formula == 'D2' and 'deuterium' in str(query).lower():
+        name = 'Deuterium gas'
+    source_url = f'{PUBCHEM_COMPOUND_URL}/{cid}' if cid else 'https://pubchem.ncbi.nlm.nih.gov/'
+    return {
+        'name': name,
+        'formula': formula,
+        'm': mass,
+        'cas': '',
+        'pubchem_cid': cid,
+        'provider': 'PubChem',
+        'provider_id': str(cid or ''),
+        'source_url': source_url,
+        'source_data_url': url,
+        'source': 'PubChem PUG REST (NIH/NLM)',
+    }
+
+
+def search_pubchem_gases(query, limit=10):
+    detail = fetch_pubchem_gas_detail_by_name(query)
+    if not detail:
+        return []
+    return [{
+        'name': detail['name'],
+        'provider': 'PubChem',
+        'provider_id': detail.get('provider_id', ''),
+        'url': detail.get('source_url', ''),
+        'detail': detail,
+    }]
+
+
+def _iaea_match_for_query(query):
+    low = str(query or '').lower()
+    for token, info in IAEA_ISOTOPE_GAS_LOOKUP.items():
+        if token in low:
+            return info
+    return None
+
+
+def _iaea_nuclide_url(nuclide):
+    return IAEA_LIVECHART_URL + '?' + urlparse.urlencode({'fields': 'ground_states', 'nuclides': nuclide})
+
+
+def fetch_iaea_isotope_gas_detail(query):
+    info = _iaea_match_for_query(query)
+    if not info:
+        return None
+    url = _iaea_nuclide_url(info['nuclide'])
+    text = _fetch_url(url)
+    rows = list(csv.DictReader(io.StringIO(text)))
+    if not rows:
+        return None
+    row = rows[0]
+    atomic_mass_micro_u = float(row.get('atomic_mass') or 0.0)
+    if atomic_mass_micro_u <= 0.0:
+        return None
+    atom_mass_u = atomic_mass_micro_u / 1e6
+    atom_count = max(_formula_atom_count(info['formula']), 1)
+    mass = atom_mass_u * atom_count
+    return {
+        'name': info['name'],
+        'formula': info['formula'],
+        'm': mass,
+        'cas': '',
+        'provider': 'IAEA',
+        'provider_id': info['nuclide'],
+        'source_url': url,
+        'source': 'IAEA LiveChart of Nuclides',
+        'half_life': row.get('half_life', ''),
+        'half_life_unit': row.get('unit_hl', ''),
+    }
+
+
+def search_iaea_isotope_gases(query, limit=10):
+    detail = fetch_iaea_isotope_gas_detail(query)
+    if not detail:
+        return []
+    return [{
+        'name': detail['name'],
+        'provider': 'IAEA',
+        'provider_id': detail.get('provider_id', ''),
+        'url': detail.get('source_url', ''),
+        'detail': detail,
+    }]
+
+
+def search_government_gases(query, limit=30):
+    results = []
+    errors = []
+    for search_fn in (search_nist_gases, search_pubchem_gases, search_iaea_isotope_gases):
+        try:
+            results.extend(search_fn(query, limit=limit))
+        except (urlerror.URLError, TimeoutError, OSError, json.JSONDecodeError, ValueError) as exc:
+            errors.append(exc)
+    seen = set()
+    unique = []
+    for result in results:
+        ident = (result.get('provider'), result.get('provider_id'), result.get('name'))
+        if ident in seen:
+            continue
+        seen.add(ident)
+        unique.append(result)
+    if not unique and errors:
+        raise errors[-1]
+    return unique[:limit]
+
+
+def fetch_government_gas_detail(result, fallback_query=None):
+    provider = result.get('provider')
+    detail = None
+    if provider == 'PubChem':
+        detail = result.get('detail') or fetch_pubchem_gas_detail_by_name(result.get('name', ''))
+    elif provider == 'IAEA':
+        detail = result.get('detail') or fetch_iaea_isotope_gas_detail(result.get('name', ''))
+    else:
+        detail = fetch_nist_gas_detail(result)
+    if detail:
+        return detail
+
+    terms = []
+    for term in (result.get('name'), fallback_query):
+        if term and term not in terms:
+            terms.append(term)
+    for term in terms:
+        for detail_fn in (fetch_pubchem_gas_detail_by_name, fetch_iaea_isotope_gas_detail):
+            try:
+                detail = detail_fn(term)
+            except (urlerror.URLError, TimeoutError, OSError, json.JSONDecodeError, ValueError):
+                detail = None
+            if detail:
+                return detail
+    return None
+
+
+def build_gas_from_nist_detail(detail):
+    name = detail.get('name', 'NIST gas')
+    formula = _normalize_imported_formula(name, detail.get('formula', ''), detail.get('m'))
+    key = _canonical_gas_key(name, formula, detail.get('nist_id'))
+    f = _estimate_degrees_of_freedom(formula)
+    gamma = round((f + 2.0) / f, 2)
+    mass = float(detail['m'])
+    cbar = int(round(_mean_speed_from_mass(mass)))
+    source = detail.get('source', 'Government molecular data source')
+    source_url = detail.get('source_url', '')
+    gas = {
+        'name': name,
+        'symbol': _format_formula_symbol(formula) or key,
+        'formula': formula,
+        'm': mass,
+        'f': f,
+        'gamma': gamma,
+        'cbar': cbar,
+        'plbar': _estimate_plbar(key),
+        'color': _deterministic_gas_color(key),
+        'nist_id': detail.get('nist_id'),
+        'pubchem_cid': detail.get('pubchem_cid'),
+        'provider': detail.get('provider'),
+        'provider_id': detail.get('provider_id'),
+        'cas': detail.get('cas', ''),
+        'source': f'{source} + simulator estimates',
+        'source_url': source_url,
+        'source_data_url': detail.get('source_data_url', source_url),
+        'sources': {
+            'm': f"{source} ({source_url})",
+            'formula': f"{source} ({source_url})",
+            'f': 'Estimated from molecular formula for room-temperature gas behavior',
+            'gamma': 'Estimated from degrees of freedom using ideal-gas Cp/Cv',
+            'cbar': 'Calculated from source molecular weight at 296 K',
+            'plbar': 'Estimated from kinetic diameter/fallback mean-free-path scaling',
+            'transport': 'Estimated from N2 transport scaling for convection visualization',
+        },
+    }
+    transport = _estimate_transport_for_gas(key, gas)
+    return key, gas, transport
+
+
+_load_custom_gases()
 
 # ── Shared application state (populated after Tk root is created) ────────────
 APP_STATE = {}
@@ -226,7 +856,7 @@ GAUGE_CONFIGS = {
         'surface': 'W', 'geometry': 'cylindrical', 'orientation': 'horizontal',
         'sat_target_mbar': 1333.0,
         'conv_gain': 0.65, 'conv_p_on_mbar': 1.0, 'conv_transition_n': 1.20,
-        'conv_gas_sensitivity': 0.50,
+        'conv_gas_sensitivity': 0.75,
         'accuracy_tiers': [
             (1.3e-4, 1.3e-3, 1.00),
             (1.3e-3, 530.0,  0.10),
@@ -613,8 +1243,8 @@ def _viscous_target_scale(config, aN2, t_hot_k, t_cold_k):
 def _convective_gas_sensitivity(config):
     """Return [0,1] gas-property sensitivity for convection augmentation.
 
-    Horizontal wire tends to suppress buoyancy-induced composition sensitivity
-    in this enclosed geometry. Square cavities amplify non-uniform flow paths.
+    Convection-enhanced horizontal wires keep gas transport differences visible
+    at high pressure. Square cavities amplify non-uniform flow paths.
     """
     if 'conv_gas_sensitivity' in config:
         return float(np.clip(config['conv_gas_sensitivity'], 0.0, 1.0))
@@ -626,8 +1256,64 @@ def _convective_gas_sensitivity(config):
     if geom == 'plates':
         return 0.35
     if orient == 'horizontal':
-        return 0.15
+        return 0.60
     return 0.55
+
+
+def _effective_gravity(config):
+    """Effective gravitational acceleration used by buoyancy/convection terms."""
+    try:
+        return max(float(config.get('gravity_m_s2', G_STD)), 0.0)
+    except (TypeError, ValueError):
+        return G_STD
+
+
+def _convection_characteristic_length(config):
+    """Characteristic length for natural-convection scaling from gauge geometry."""
+    geom = config.get('geometry')
+    if geom == 'plates':
+        return max(float(config.get('gap', 1e-3)), 1e-6)
+    r2 = float(config.get('enc_r', 8e-3))
+    r1 = float(config.get('wire_r', 5e-6))
+    return max(r2 - r1, 5e-5)
+
+
+def _convection_geometry_factor(config):
+    """Geometry/orientation coupling for buoyant flow reaching the hot element."""
+    geom = config.get('geometry')
+    orient = config.get('orientation', 'vertical')
+    if geom == 'square_cavity':
+        return 0.95
+    if geom == 'plates':
+        return 0.45
+    if orient == 'horizontal':
+        return 1.15
+    return 0.70
+
+
+def _convection_pressure_activation(config, p_pa):
+    """Smooth pressure gate so buoyancy appears in the gauge's high-pressure range."""
+    p_mbar = convert_pressure(np.maximum(np.asarray(p_pa, dtype=np.float64), 0.0), 'mbar')
+    p_on = max(float(config.get('conv_p_on_mbar', 80.0)), 1e-9)
+    n = max(float(config.get('conv_transition_n', 1.25)), 0.4)
+    scaled = np.power(p_mbar / p_on, n)
+    activation = scaled / (1.0 + scaled)
+    if np.ndim(activation) == 0:
+        return float(activation)
+    return activation
+
+
+def _natural_convection_nusselt(ra, pr, config):
+    """Return an educational Churchill-Chu style natural-convection Nusselt number."""
+    ra_safe = np.maximum(ra, 0.0)
+    pr_safe = np.maximum(pr, 1e-12)
+    geom = config.get('geometry')
+    orient = config.get('orientation', 'vertical')
+    if geom == 'cylindrical' and orient == 'horizontal':
+        return 0.36 + (0.518 * np.power(ra_safe, 0.25)) / np.power(
+            1.0 + np.power(0.559 / pr_safe, 9.0 / 16.0), 4.0 / 9.0)
+    return 0.68 + (0.67 * np.power(ra_safe, 0.25)) / np.power(
+        1.0 + np.power(0.492 / pr_safe, 9.0 / 16.0), 4.0 / 9.0)
 
 
 def _convective_viscous_multiplier(gas_key, gas, config, p_pa):
@@ -662,42 +1348,27 @@ def _convective_viscous_multiplier(gas_key, gas, config, p_pa):
     alpha = k / max(rho * cp_mass, 1e-12)
     pr = float(np.clip(nu / max(alpha, 1e-12), 0.2, 4.0))
 
-    geom = config.get('geometry')
-    orient = config.get('orientation', 'vertical')
-    if geom == 'plates':
-        l_char = max(float(config.get('gap', 1e-3)), 1e-6)
-    else:
-        r2 = float(config.get('enc_r', 8e-3))
-        r1 = float(config.get('wire_r', 5e-6))
-        l_char = max(r2 - r1, 5e-5)
+    l_char = _convection_characteristic_length(config)
+    g_eff = _effective_gravity(config)
+    if g_eff <= 0.0:
+        return 0.0
 
     beta = 1.0 / t_film
-    ra = G_STD * beta * d_t * (l_char ** 3) / max(nu * alpha, 1e-18)
+    ra = g_eff * beta * d_t * (l_char ** 3) / max(nu * alpha, 1e-18)
     ra = float(np.clip(ra, 0.0, 1e12))
 
-    if geom == 'cylindrical' and orient == 'horizontal':
-        # Churchill-Chu style correlation for horizontal cylinder.
-        nu_nat = 0.36 + (0.518 * (ra ** 0.25)) / ((1.0 + (0.559 / pr) ** (9.0 / 16.0)) ** (4.0 / 9.0))
-    else:
-        # Vertical-wire / plate-like correlation.
-        nu_nat = 0.68 + (0.67 * (ra ** 0.25)) / ((1.0 + (0.492 / pr) ** (9.0 / 16.0)) ** (4.0 / 9.0))
+    nu_nat = _natural_convection_nusselt(ra, pr, config)
 
-    conv_strength = max(nu_nat - 1.0, 0.0)
+    conv_strength = max(float(nu_nat) - 1.0, 0.0)
     ra_on = max(float(config.get('conv_ra_on', 70.0)), 1e-9)
     ra_n = max(float(config.get('conv_transition_n', 1.25)), 0.4)
     ra_scale = (ra / ra_on) ** ra_n
-    activation = ra_scale / (1.0 + ra_scale)
+    activation = _convection_pressure_activation(config, p_pa) * (ra_scale / (1.0 + ra_scale))
 
-    if geom == 'square_cavity':
-        geom_factor = 0.90
-    elif geom == 'plates':
-        geom_factor = 0.55
-    else:
-        geom_factor = 1.0
-
-    gain = float(config.get('conv_gain', 0.22))
-    mult = gain * geom_factor * conv_strength * activation * (1.0 + GRAVITY_Z_CONVECTION_GAIN)
-    return float(np.clip(mult, 0.0, 1.4))
+    gain = float(config.get('conv_gain', DEFAULT_CONVECTION_GAIN))
+    max_mult = float(config.get('conv_max_mult', 1.4))
+    mult = gain * _convection_geometry_factor(config) * conv_strength * activation
+    return float(np.clip(mult, 0.0, max_mult))
 
 
 def _convective_viscous_multiplier_vec(gas_key, gas, config, pressures_pa):
@@ -728,40 +1399,27 @@ def _convective_viscous_multiplier_vec(gas_key, gas, config, pressures_pa):
     alpha = k / np.maximum(rho * cp_mass, 1e-12)
     pr = np.clip(nu / np.maximum(alpha, 1e-12), 0.2, 4.0)
 
-    geom = config.get('geometry')
-    orient = config.get('orientation', 'vertical')
-    if geom == 'plates':
-        l_char = max(float(config.get('gap', 1e-3)), 1e-6)
-    else:
-        r2 = float(config.get('enc_r', 8e-3))
-        r1 = float(config.get('wire_r', 5e-6))
-        l_char = max(r2 - r1, 5e-5)
+    l_char = _convection_characteristic_length(config)
+    g_eff = _effective_gravity(config)
+    if g_eff <= 0.0:
+        return np.zeros_like(pressures_pa)
 
     beta = 1.0 / t_film
-    ra = G_STD * beta * d_t * (l_char ** 3) / np.maximum(nu * alpha, 1e-18)
+    ra = g_eff * beta * d_t * (l_char ** 3) / np.maximum(nu * alpha, 1e-18)
     ra = np.clip(ra, 0.0, 1e12)
 
-    if geom == 'cylindrical' and orient == 'horizontal':
-        nu_nat = 0.36 + (0.518 * np.power(ra, 0.25)) / np.power(1.0 + np.power(0.559 / pr, 9.0 / 16.0), 4.0 / 9.0)
-    else:
-        nu_nat = 0.68 + (0.67 * np.power(ra, 0.25)) / np.power(1.0 + np.power(0.492 / pr, 9.0 / 16.0), 4.0 / 9.0)
+    nu_nat = _natural_convection_nusselt(ra, pr, config)
 
     conv_strength = np.maximum(nu_nat - 1.0, 0.0)
     ra_on = max(float(config.get('conv_ra_on', 70.0)), 1e-9)
     ra_n = max(float(config.get('conv_transition_n', 1.25)), 0.4)
     ra_scale = np.power(np.maximum(ra, 0.0) / ra_on, ra_n)
-    activation = ra_scale / (1.0 + ra_scale)
+    activation = _convection_pressure_activation(config, pressures_pa) * (ra_scale / (1.0 + ra_scale))
 
-    if geom == 'square_cavity':
-        geom_factor = 0.90
-    elif geom == 'plates':
-        geom_factor = 0.55
-    else:
-        geom_factor = 1.0
-
-    gain = float(config.get('conv_gain', 0.22))
-    mult = gain * geom_factor * conv_strength * activation * (1.0 + GRAVITY_Z_CONVECTION_GAIN)
-    return np.clip(mult, 0.0, 1.4)
+    gain = float(config.get('conv_gain', DEFAULT_CONVECTION_GAIN))
+    max_mult = float(config.get('conv_max_mult', 1.4))
+    mult = gain * _convection_geometry_factor(config) * conv_strength * activation
+    return np.clip(mult, 0.0, max_mult)
 
 def calc_heat_flow(gas_key, config, p, aN2=0.6, t_hot_override=None, t_cold_override=None):
     """Calculate heat flow for a gas at pressure p using a gauge configuration."""
@@ -845,6 +1503,237 @@ def calc_heat_flow_vec(gas_key, config, pressures, aN2=0.6, t_hot_override=None,
     denom = np.where((Q_mol != 0) & (Q_visc != 0), 1.0 / Q_mol + 1.0 / Q_visc, 1e30)
     Q_combined = 1.0 / denom
     return Q_combined, Q_mol, Q_visc
+
+
+_N2_HEAT_FLOW_LOOKUP_CACHE = {}
+
+
+def _freeze_for_cache(value):
+    if isinstance(value, dict):
+        return tuple(sorted((str(k), _freeze_for_cache(v)) for k, v in value.items()))
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_for_cache(v) for v in value)
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float):
+        return round(value, 12)
+    if isinstance(value, (str, int, bool, type(None))):
+        return value
+    return repr(value)
+
+
+def _cache_put_bounded(cache, key, value, limit=48):
+    if key not in cache and len(cache) >= limit:
+        cache.pop(next(iter(cache)))
+    cache[key] = value
+
+
+def _n2_heat_flow_lookup(config, aN2=0.6, t_hot_override=None, t_cold_override=None):
+    key = (
+        _freeze_for_cache(config),
+        round(float(aN2), 12),
+        None if t_hot_override is None else round(float(t_hot_override), 12),
+        None if t_cold_override is None else round(float(t_cold_override), 12),
+    )
+    cached = _N2_HEAT_FLOW_LOOKUP_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    p_ref = np.logspace(-10, 6.3, 480)
+    q_ref, _, _ = calc_heat_flow_vec(
+        'N2',
+        config,
+        p_ref,
+        aN2=aN2,
+        t_hot_override=t_hot_override,
+        t_cold_override=t_cold_override,
+    )
+
+    valid = np.isfinite(q_ref) & (q_ref > 0.0)
+    if np.count_nonzero(valid) < 2:
+        table = (np.array([], dtype=np.float64), np.array([], dtype=np.float64))
+        _cache_put_bounded(_N2_HEAT_FLOW_LOOKUP_CACHE, key, table)
+        return table
+
+    log_q_ref = np.log(q_ref[valid])
+    log_p_ref = np.log(p_ref[valid])
+    order = np.argsort(log_q_ref)
+    log_q_ref = log_q_ref[order]
+    log_p_ref = log_p_ref[order]
+    unique = np.concatenate(([True], np.diff(log_q_ref) > 1e-12))
+    table = (log_q_ref[unique], log_p_ref[unique])
+    _cache_put_bounded(_N2_HEAT_FLOW_LOOKUP_CACHE, key, table)
+    return table
+
+
+def _invert_n2_heat_flow_array(q_values, config, aN2=0.6,
+                               t_hot_override=None, t_cold_override=None,
+                               fallback=None):
+    q_arr = np.asarray(q_values, dtype=np.float64)
+    scalar = q_arr.ndim == 0
+    log_q_ref, log_p_ref = _n2_heat_flow_lookup(
+        config,
+        aN2=aN2,
+        t_hot_override=t_hot_override,
+        t_cold_override=t_cold_override,
+    )
+    if len(log_q_ref) < 2:
+        result = np.asarray(fallback, dtype=np.float64) if fallback is not None else np.maximum(q_arr, 1e-20)
+        return float(result) if scalar else result
+
+    q_min = math.exp(float(log_q_ref[0]))
+    log_q = np.log(np.maximum(q_arr, q_min))
+    log_p_ind = np.interp(
+        log_q,
+        log_q_ref,
+        log_p_ref,
+        left=float(log_p_ref[0]),
+        right=float(log_p_ref[-1]),
+    )
+    result = np.exp(log_p_ind)
+    return float(result) if scalar else result
+
+
+def _normalize_mixture_fractions(fracs):
+    cleaned = {}
+    for gas_key, fraction in (fracs or {}).items():
+        if gas_key not in GAS_DATA:
+            continue
+        try:
+            value = max(float(fraction), 0.0)
+        except (TypeError, ValueError):
+            continue
+        if value > 0.0:
+            cleaned[gas_key] = value
+
+    total = sum(cleaned.values())
+    if total <= 0.0:
+        return {'N2': 1.0}
+    return {gas_key: value / total for gas_key, value in cleaned.items()}
+
+
+def calc_mixture_heat_flow(fracs, config, p, aN2=0.6, t_hot_override=None, t_cold_override=None):
+    """Calculate mixture heat flow by mole-fraction weighting gas heat flows."""
+    q_combined_total = 0.0
+    q_mol_total = 0.0
+    q_visc_total = 0.0
+    for gas_key, fraction in _normalize_mixture_fractions(fracs).items():
+        q_combined, q_mol, q_visc = calc_heat_flow(
+            gas_key,
+            config,
+            p,
+            aN2=aN2,
+            t_hot_override=t_hot_override,
+            t_cold_override=t_cold_override,
+        )
+        q_combined_total += fraction * q_combined
+        q_mol_total += fraction * q_mol
+        q_visc_total += fraction * q_visc
+    return q_combined_total, q_mol_total, q_visc_total
+
+
+def calc_mixture_heat_flow_vec(fracs, config, pressures, aN2=0.6,
+                               t_hot_override=None, t_cold_override=None):
+    """Vectorised mixture heat flow by mole-fraction weighting gas heat flows."""
+    pressures = np.asarray(pressures, dtype=np.float64)
+    q_combined_total = np.zeros_like(pressures, dtype=np.float64)
+    q_mol_total = np.zeros_like(pressures, dtype=np.float64)
+    q_visc_total = np.zeros_like(pressures, dtype=np.float64)
+    for gas_key, fraction in _normalize_mixture_fractions(fracs).items():
+        q_combined, q_mol, q_visc = calc_heat_flow_vec(
+            gas_key,
+            config,
+            pressures,
+            aN2=aN2,
+            t_hot_override=t_hot_override,
+            t_cold_override=t_cold_override,
+        )
+        q_combined_total += fraction * q_combined
+        q_mol_total += fraction * q_mol
+        q_visc_total += fraction * q_visc
+    return q_combined_total, q_mol_total, q_visc_total
+
+
+def _invert_n2_heat_flow_for_config(q_target, config, aN2=0.6,
+                                    t_hot_override=None, t_cold_override=None,
+                                    fallback=None):
+    q_target = max(float(q_target), 0.0)
+    return _invert_n2_heat_flow_array(
+        q_target,
+        config,
+        aN2=aN2,
+        t_hot_override=t_hot_override,
+        t_cold_override=t_cold_override,
+        fallback=fallback,
+    )
+
+
+def calc_mixture_correction_factor_physics(fracs, config, p_true, aN2=0.6,
+                                           t_hot_override=None, t_cold_override=None):
+    """Return p_true / p_indicated from the simulated N2-calibrated heat-flow curve."""
+    p_real = max(float(p_true), 1e-20)
+    q_mix, _, _ = calc_mixture_heat_flow(
+        fracs,
+        config,
+        p_real,
+        aN2=aN2,
+        t_hot_override=t_hot_override,
+        t_cold_override=t_cold_override,
+    )
+    p_indicated = _invert_n2_heat_flow_for_config(
+        q_mix,
+        config,
+        aN2=aN2,
+        t_hot_override=t_hot_override,
+        t_cold_override=t_cold_override,
+        fallback=p_real,
+    )
+    return p_real / p_indicated if p_indicated > 0.0 else float('inf')
+
+
+def calc_mixture_indicated_pressure_curve_physics(fracs, config, pressures, aN2=0.6,
+                                                 t_hot_override=None, t_cold_override=None):
+    """Return N2-calibrated indicated pressure for a mixture pressure curve."""
+    p_true = np.maximum(np.asarray(pressures, dtype=np.float64), 1e-20)
+    q_mix, _, _ = calc_mixture_heat_flow_vec(
+        fracs,
+        config,
+        p_true,
+        aN2=aN2,
+        t_hot_override=t_hot_override,
+        t_cold_override=t_cold_override,
+    )
+    return _invert_n2_heat_flow_array(
+        q_mix,
+        config,
+        aN2=aN2,
+        t_hot_override=t_hot_override,
+        t_cold_override=t_cold_override,
+        fallback=p_true,
+    )
+
+
+def calc_correction_factor_curve_physics(gas_key, config, pressures, aN2=0.6,
+                                         t_hot_override=None, t_cold_override=None):
+    """Vector pressure-dependent CF from simulated gas heat flow and N2 inversion."""
+    p_true = np.maximum(np.asarray(pressures, dtype=np.float64), 1e-20)
+    q_gas, _, _ = calc_heat_flow_vec(
+        gas_key,
+        config,
+        p_true,
+        aN2=aN2,
+        t_hot_override=t_hot_override,
+        t_cold_override=t_cold_override,
+    )
+    p_indicated = _invert_n2_heat_flow_array(
+        q_gas,
+        config,
+        aN2=aN2,
+        t_hot_override=t_hot_override,
+        t_cold_override=t_cold_override,
+        fallback=p_true,
+    )
+    return np.where(p_indicated > 0.0, p_true / p_indicated, np.inf)
 
 
 def calc_correction_factor_theory(gas_key, aN2=0.6, surface='W'):
@@ -1153,14 +2042,429 @@ class PressureUnitSelector(ttk.Frame):
             self._on_change()
 
 
+class GasPaletteDialog:
+    """Popup for importing government-sourced gases and editing the custom palette."""
+
+    def __init__(self, parent, on_close=None):
+        self.parent = parent
+        self.on_close = on_close
+        self.nist_results = []
+        self.selected_result = None
+        self.current_source_url = ''
+        self._filter_text = tk.StringVar(value='')
+
+        self.dlg = tk.Toplevel(parent)
+        self.dlg.title('Custom Gas Palette')
+        self.dlg.geometry('1120x700')
+        self.dlg.minsize(980, 600)
+        self.dlg.transient(parent.winfo_toplevel())
+        self.dlg.protocol('WM_DELETE_WINDOW', self._close)
+
+        self._build_ui()
+        self._refresh_known_tree()
+        self._show_gas_details('N2')
+
+    def _build_ui(self):
+        footer = ttk.Frame(self.dlg)
+        footer.pack(side='bottom', fill='x', padx=10, pady=(0, 10))
+        self.footer_status = ttk.Label(footer, text='', style='Dim.TLabel')
+        self.footer_status.pack(side='left')
+        ttk.Button(footer, text='Save Palette', command=self._save).pack(side='right', padx=(6, 0))
+        ttk.Button(footer, text='Close', command=self._close).pack(side='right')
+
+        outer = ttk.Frame(self.dlg)
+        outer.pack(side='top', fill='both', expand=True, padx=10, pady=10)
+
+        left = ttk.Frame(outer)
+        left.pack(side='left', fill='both', expand=True, padx=(0, 8))
+        right = ttk.Frame(outer)
+        right.pack(side='right', fill='both', expand=True, padx=(8, 0))
+
+        nist_frame = ttk.LabelFrame(left, text=' Government Gas Data Search ')
+        nist_frame.pack(fill='both', expand=True, pady=(0, 8))
+
+        search_row = ttk.Frame(nist_frame, style='Card.TFrame')
+        search_row.pack(fill='x', padx=8, pady=(8, 4))
+        self.nist_query = tk.StringVar(value='argon')
+        ttk.Entry(search_row, textvariable=self.nist_query).pack(side='left', fill='x', expand=True, padx=(0, 6))
+        ttk.Button(search_row, text='Search Sources', command=self._search_nist).pack(side='left', padx=(0, 4))
+
+        quick_row = ttk.Frame(nist_frame, style='Card.TFrame')
+        quick_row.pack(fill='x', padx=8, pady=(0, 4))
+        ttk.Label(quick_row, text='Quick:', style='Dim.TLabel').pack(side='left', padx=(0, 4))
+        self.quick_var = tk.StringVar(value=QUICK_NIST_GAS_NAMES[0])
+        quick_combo = ttk.Combobox(quick_row, textvariable=self.quick_var,
+                                   values=QUICK_NIST_GAS_NAMES, state='readonly', width=22)
+        quick_combo.pack(side='left')
+        quick_combo.bind('<<ComboboxSelected>>', self._quick_search)
+
+        cols = ('source', 'name', 'provider_id')
+        self.nist_tree = ttk.Treeview(nist_frame, columns=cols, show='headings', height=8)
+        self.nist_tree.heading('source', text='Source')
+        self.nist_tree.heading('name', text='Name')
+        self.nist_tree.heading('provider_id', text='ID')
+        self.nist_tree.column('source', width=80)
+        self.nist_tree.column('name', width=250)
+        self.nist_tree.column('provider_id', width=90)
+        self.nist_tree.pack(fill='both', expand=True, padx=8, pady=4)
+        self.nist_tree.bind('<<TreeviewSelect>>', self._on_nist_select)
+        self.nist_tree.bind('<Double-1>', lambda e: self._import_selected_nist())
+
+        nist_btns = ttk.Frame(nist_frame, style='Card.TFrame')
+        nist_btns.pack(fill='x', padx=8, pady=(0, 8))
+        ttk.Button(nist_btns, text='Fetch Details', command=self._fetch_selected_details).pack(side='left')
+        ttk.Button(nist_btns, text='Import + Use', command=self._import_selected_nist).pack(side='left', padx=(6, 0))
+        self.nist_status = ttk.Label(nist_btns, text='', style='Dim.TLabel')
+        self.nist_status.pack(side='right')
+
+        detail_frame = ttk.LabelFrame(left, text=' Selected Gas Properties and Sources ')
+        detail_frame.pack(fill='both', expand=True)
+        detail_body = ttk.Frame(detail_frame, style='Card.TFrame')
+        detail_body.pack(fill='both', expand=True, padx=8, pady=(8, 4))
+        self.detail_text = tk.Text(detail_body, wrap='word', height=10, font=(FONT_MONO, 9),
+                                   bg=COLORS['bg_input'], fg=COLORS['text'], insertbackground=COLORS['text'])
+        detail_scroll = ttk.Scrollbar(detail_body, orient='vertical', command=self.detail_text.yview)
+        self.detail_text.configure(yscrollcommand=detail_scroll.set)
+        self.detail_text.pack(side='left', fill='both', expand=True)
+        detail_scroll.pack(side='right', fill='y')
+        self.detail_text.configure(state='disabled')
+
+        detail_actions = ttk.Frame(detail_frame, style='Card.TFrame')
+        detail_actions.pack(fill='x', padx=8, pady=(0, 8))
+        self.source_hint = ttk.Label(detail_actions, text='No source selected', style='Dim.TLabel')
+        self.source_hint.pack(side='left')
+        self.source_button = ttk.Button(detail_actions, text='Open Source', command=self._open_current_source)
+        self.source_button.pack(side='right')
+        self.source_button.configure(state='disabled')
+
+        palette_frame = ttk.LabelFrame(right, text=' Custom Palette ')
+        palette_frame.pack(fill='both', expand=True)
+
+        filter_row = ttk.Frame(palette_frame, style='Card.TFrame')
+        filter_row.pack(fill='x', padx=8, pady=(8, 4))
+        ttk.Label(filter_row, text='Filter:', style='Dim.TLabel').pack(side='left')
+        filter_entry = ttk.Entry(filter_row, textvariable=self._filter_text)
+        filter_entry.pack(side='left', fill='x', expand=True, padx=(6, 0))
+        filter_entry.bind('<KeyRelease>', lambda e: self._refresh_known_tree())
+
+        cols = ('order', 'key', 'name', 'mass', 'source')
+        self.known_tree = ttk.Treeview(palette_frame, columns=cols, show='headings', height=15, selectmode='browse')
+        headings = {'order': '#', 'key': 'Key', 'name': 'Gas', 'mass': 'amu', 'source': 'Source'}
+        widths = {'order': 42, 'key': 76, 'name': 220, 'mass': 64, 'source': 100}
+        for col in cols:
+            self.known_tree.heading(col, text=headings[col])
+            self.known_tree.column(col, width=widths[col])
+        self.known_tree.pack(fill='both', expand=True, padx=8, pady=4)
+        self.known_tree.bind('<<TreeviewSelect>>', self._on_known_select)
+        self.known_tree.bind('<Double-1>', lambda e: self._toggle_selected_known())
+
+        pal_btns = ttk.Frame(palette_frame, style='Card.TFrame')
+        pal_btns.pack(fill='x', padx=8, pady=(0, 3))
+        ttk.Button(pal_btns, text='Add', command=self._add_selected_known).pack(side='left')
+        ttk.Button(pal_btns, text='Remove', command=self._remove_selected_known).pack(side='left', padx=(6, 0))
+        ttk.Button(pal_btns, text='Move Up', command=lambda: self._move_selected_palette(-1)).pack(side='left', padx=(6, 0))
+        ttk.Button(pal_btns, text='Move Down', command=lambda: self._move_selected_palette(1)).pack(side='left', padx=(6, 0))
+
+        pal_btns2 = ttk.Frame(palette_frame, style='Card.TFrame')
+        pal_btns2.pack(fill='x', padx=8, pady=(0, 8))
+        ttk.Button(pal_btns2, text='Reset to Default Order', command=self._reset_palette).pack(side='left')
+
+    def _quick_search(self, event=None):
+        self.nist_query.set(self.quick_var.get())
+        self._search_nist()
+
+    def _set_status(self, text):
+        self.nist_status.config(text=text)
+        self.dlg.update_idletasks()
+
+    def _search_nist(self):
+        query = self.nist_query.get().strip()
+        if not query:
+            return
+        self._set_status('Searching...')
+        try:
+            self.nist_results = search_government_gases(query)
+        except (urlerror.URLError, TimeoutError, OSError, json.JSONDecodeError, ValueError) as exc:
+            self.nist_results = []
+            self._set_status('Sources unavailable')
+            messagebox.showwarning('Gas Search', f'Could not query government gas sources:\n{exc}', parent=self.dlg)
+            return
+        for item in self.nist_tree.get_children():
+            self.nist_tree.delete(item)
+        for idx, result in enumerate(self.nist_results):
+            self.nist_tree.insert('', 'end', iid=str(idx), values=(
+                result.get('provider', 'Source'),
+                result.get('name', ''),
+                result.get('provider_id', result.get('nist_id', '')),
+            ))
+        self._set_status(f'{len(self.nist_results)} result(s)')
+
+    def _on_nist_select(self, event=None):
+        sel = self.nist_tree.selection()
+        if not sel:
+            return
+        idx = int(sel[0])
+        self.selected_result = self.nist_results[idx]
+        detail = self.selected_result.get('detail')
+        if detail:
+            self._show_detail_payload(detail)
+        else:
+            self._write_details(
+                f"{self.selected_result.get('name', '')}\n"
+                f"Source: {self.selected_result.get('provider', 'Government source')}\n"
+                f"ID: {self.selected_result.get('provider_id', self.selected_result.get('nist_id', ''))}\n\n"
+                "Fetch details to inspect usable simulation properties.",
+                source_url=self.selected_result.get('url', ''),
+            )
+
+    def _fetch_selected_details(self):
+        if not self.selected_result:
+            return None
+        self._set_status('Fetching...')
+        try:
+            detail = fetch_government_gas_detail(self.selected_result, fallback_query=self.nist_query.get().strip())
+        except (urlerror.URLError, TimeoutError, OSError, json.JSONDecodeError, ValueError) as exc:
+            self._set_status('Fetch failed')
+            messagebox.showwarning('Gas Fetch', f'Could not fetch gas details:\n{exc}', parent=self.dlg)
+            return None
+        if not detail:
+            self._set_status('No molecular weight')
+            messagebox.showinfo(
+                'Gas Fetch',
+                'No checked government source returned enough molecular-weight data for simulation.',
+                parent=self.dlg,
+            )
+            return None
+        self.selected_result['detail'] = detail
+        self._show_detail_payload(detail)
+        self._set_status('Details ready')
+        return detail
+
+    def _import_selected_nist(self):
+        detail = self._fetch_selected_details()
+        if not detail:
+            return
+        key, gas, transport = build_gas_from_nist_detail(detail)
+        key = _register_simulation_gas(key, gas, transport=transport, custom=True)
+        if key not in CUSTOM_GAS_STATE['palette']:
+            CUSTOM_GAS_STATE['palette'].append(key)
+        save_custom_gases()
+        self._refresh_known_tree(select_key=key)
+        self._show_gas_details(key)
+        notify_gas_palette_changed()
+        self._set_status(f'Imported {key}')
+
+    def _clean_palette(self):
+        seen = set()
+        cleaned = []
+        for key in CUSTOM_GAS_STATE.get('palette', []):
+            if key in GAS_DATA and key not in seen:
+                cleaned.append(key)
+                seen.add(key)
+        if not cleaned:
+            cleaned = ['N2'] if 'N2' in GAS_DATA else [next(iter(GAS_DATA))]
+        CUSTOM_GAS_STATE['palette'] = cleaned
+        return cleaned
+
+    def _filtered_gas_keys(self, keys, filt):
+        if not filt:
+            return list(keys)
+        matches = []
+        for key in keys:
+            gas = GAS_DATA[key]
+            hay = f"{key} {gas.get('name', '')} {gas.get('symbol', '')} {gas.get('formula', '')}".lower()
+            if filt in hay:
+                matches.append(key)
+        return matches
+
+    def _refresh_known_tree(self, select_key=None):
+        filt = self._filter_text.get().strip().lower()
+        palette = self._clean_palette()
+        selected = set(palette)
+        for item in self.known_tree.get_children():
+            self.known_tree.delete(item)
+
+        ordered_keys = self._filtered_gas_keys(palette, filt)
+        available_keys = sorted(
+            self._filtered_gas_keys([k for k in GAS_DATA if k not in selected], filt),
+            key=lambda k: (k not in DEFAULT_GAS_KEYS, GAS_DATA[k].get('name', k)),
+        )
+
+        for key in ordered_keys + available_keys:
+            gas = GAS_DATA[key]
+            src = _gas_source_label(gas)
+            order = str(palette.index(key) + 1) if key in selected else ''
+            self.known_tree.insert('', 'end', iid=key, values=(
+                order,
+                key,
+                gas.get('name', key),
+                f"{float(gas.get('m', 0.0)):.4g}",
+                src,
+            ))
+        if select_key and self.known_tree.exists(select_key):
+            self.known_tree.selection_set(select_key)
+            self.known_tree.see(select_key)
+
+    def _on_known_select(self, event=None):
+        sel = self.known_tree.selection()
+        if sel:
+            self._show_gas_details(sel[0])
+
+    def _selected_known_key(self):
+        sel = self.known_tree.selection()
+        return sel[0] if sel else None
+
+    def _mark_palette_dirty(self, message='Palette changed'):
+        self.footer_status.config(text=message)
+
+    def _add_selected_known(self):
+        key = self._selected_known_key()
+        if not key:
+            return
+        palette = self._clean_palette()
+        if key not in palette:
+            palette.append(key)
+            CUSTOM_GAS_STATE['palette'] = palette
+            self._mark_palette_dirty(f'Added {key}')
+        self._refresh_known_tree(select_key=key)
+        self._show_gas_details(key)
+
+    def _remove_selected_known(self):
+        key = self._selected_known_key()
+        if not key:
+            return
+        palette = self._clean_palette()
+        if key not in palette:
+            return
+        if len(palette) <= 1:
+            messagebox.showinfo('Custom Palette', 'Keep at least one gas in the custom palette.', parent=self.dlg)
+            return
+        palette.remove(key)
+        CUSTOM_GAS_STATE['palette'] = palette
+        self._mark_palette_dirty(f'Removed {key}')
+        self._refresh_known_tree(select_key=key)
+        self._show_gas_details(key)
+
+    def _move_selected_palette(self, direction):
+        key = self._selected_known_key()
+        if not key:
+            return
+        palette = self._clean_palette()
+        if key not in palette:
+            messagebox.showinfo('Custom Palette', 'Add this gas before moving it in the custom palette.', parent=self.dlg)
+            return
+        idx = palette.index(key)
+        new_idx = idx + int(direction)
+        if new_idx < 0 or new_idx >= len(palette):
+            return
+        palette[idx], palette[new_idx] = palette[new_idx], palette[idx]
+        CUSTOM_GAS_STATE['palette'] = palette
+        self._mark_palette_dirty(f'Moved {key}')
+        self._refresh_known_tree(select_key=key)
+        self._show_gas_details(key)
+
+    def _toggle_selected_known(self):
+        key = self._selected_known_key()
+        if not key:
+            return
+        palette = self._clean_palette()
+        if key in palette:
+            self._remove_selected_known()
+        else:
+            self._add_selected_known()
+
+    def _reset_palette(self):
+        CUSTOM_GAS_STATE['palette'] = list(DEFAULT_GAS_KEYS)
+        self._mark_palette_dirty('Restored default palette order')
+        self._refresh_known_tree(select_key='N2')
+        self._show_gas_details('N2')
+
+    def _set_source_url(self, source_url):
+        self.current_source_url = source_url or ''
+        if self.current_source_url:
+            self.source_button.configure(state='normal')
+            self.source_hint.config(text='Source link ready')
+        else:
+            self.source_button.configure(state='disabled')
+            self.source_hint.config(text='No source selected')
+
+    def _open_current_source(self):
+        if self.current_source_url:
+            webbrowser.open(self.current_source_url)
+
+    def _write_details(self, text, source_url=''):
+        self.detail_text.configure(state='normal')
+        self.detail_text.delete('1.0', 'end')
+        self.detail_text.insert('1.0', text)
+        self.detail_text.configure(state='disabled')
+        self._set_source_url(source_url)
+
+    def _show_detail_payload(self, detail):
+        formula = detail.get('formula') or '(not listed)'
+        source = detail.get('source', 'Government source')
+        provider_id = detail.get('provider_id') or detail.get('nist_id') or detail.get('pubchem_cid') or 'not listed'
+        source_url = detail.get('source_url', '')
+        text = (
+            f"Name: {detail.get('name', '')}\n"
+            f"Formula: {formula}\n"
+            f"Molecular weight: {detail.get('m', 0):.6g} amu\n"
+            f"CAS: {detail.get('cas', '') or 'not listed'}\n"
+            f"Source ID: {provider_id}\n"
+            f"Source: {source}\n"
+            f"URL: {source_url}\n\n"
+            "On import, the simulator uses source formula/molecular weight directly and estimates the Pirani-only fields that the source does not publish."
+        )
+        self._write_details(text, source_url=source_url)
+
+    def _show_gas_details(self, key):
+        gas = GAS_DATA.get(key)
+        if not gas:
+            return
+        transport = GAS_TRANSPORT.get(key, _estimate_transport(key))
+        text = (
+            f"Key: {key}\n"
+            f"Name: {gas.get('name', key)}\n"
+            f"Symbol/formula: {gas.get('symbol', key)} / {gas.get('formula', gas.get('symbol', key))}\n"
+            f"Molecular mass: {float(gas.get('m', 0.0)):.6g} amu\n"
+            f"Degrees of freedom: {gas.get('f')}\n"
+            f"gamma Cp/Cv: {gas.get('gamma')}\n"
+            f"Mean thermal speed: {gas.get('cbar')} m/s\n"
+            f"p*lambda product: {float(gas.get('plbar', 0.0)):.4g} m*mbar\n"
+            f"Transport mu0/k0: {transport.get('mu0', 0.0):.4g} Pa*s / {transport.get('k0', 0.0):.4g} W/m/K\n"
+            f"In custom palette: {'Yes' if key in CUSTOM_GAS_STATE.get('palette', []) else 'No'}\n\n"
+            f"Sources:\n{_gas_sources_text(gas)}"
+        )
+        self._write_details(text, source_url=gas.get('source_url', ''))
+
+    def _save(self):
+        self._clean_palette()
+        save_custom_gases()
+        notify_gas_palette_changed()
+        self._set_status('Saved')
+        self.footer_status.config(text='Palette saved')
+
+    def _close(self):
+        self._save()
+        if callable(self.on_close):
+            self.on_close()
+        self.dlg.destroy()
+
+
+def open_gas_palette_dialog(parent, on_close=None):
+    return GasPaletteDialog(parent, on_close=on_close)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  TAB: HEAT TRANSFER 2D SIMULATOR
 # ══════════════════════════════════════════════════════════════════════════════
 
 class Simulator2DTab(ttk.Frame):
+    PRESSURE_POINTS = 240
+
     def __init__(self, parent):
         super().__init__(parent)
         self.gas_vars = {}
+        self.gas_checks = {}
         self._update_job = None
         self._build_ui()
         self._on_config_change()
@@ -1184,17 +2488,23 @@ class Simulator2DTab(ttk.Frame):
                             style='TCheckbutton').pack(anchor='w', padx=8, pady=2)
 
         # Gas selector
-        gas_frame = ttk.LabelFrame(ctrl_frame, text=' Gas Species ')
-        gas_frame.pack(fill='x', pady=(0, 8))
+        self.gas_frame = ttk.LabelFrame(ctrl_frame, text=' Gas Species ')
+        self.gas_frame.pack(fill='x', pady=(0, 8))
 
-        self.gas_vars = {}
-        for i, (key, gas) in enumerate(GAS_DATA.items()):
-            var = tk.BooleanVar(value=(key in ['N2', 'He', 'Ar', 'Xe']))
-            cb = ttk.Checkbutton(gas_frame, text=f"{gas['symbol']} ({gas['name']})",
-                                 variable=var, command=self._schedule_update,
-                                 style='TCheckbutton')
-            cb.pack(anchor='w', padx=8, pady=1)
-            self.gas_vars[key] = var
+        palette_row = ttk.Frame(self.gas_frame, style='Card.TFrame')
+        palette_row.pack(fill='x', padx=8, pady=(6, 2))
+        ttk.Label(palette_row, text='Palette', style='Card.TLabel').pack(side='left')
+        self.palette_mode_var = tk.StringVar(value='default')
+        palette_combo = ttk.Combobox(palette_row, textvariable=self.palette_mode_var,
+                                     values=['default', 'custom'], state='readonly', width=9)
+        palette_combo.pack(side='left', padx=(6, 4))
+        palette_combo.bind('<<ComboboxSelected>>', lambda e: self._rebuild_gas_checkbuttons())
+        ttk.Button(palette_row, text='Edit Custom',
+                   command=lambda: open_gas_palette_dialog(self, self.on_gas_palette_changed)).pack(side='right')
+
+        self.gas_list_frame = ttk.Frame(self.gas_frame, style='Card.TFrame')
+        self.gas_list_frame.pack(fill='x', padx=4, pady=(2, 6))
+        self._rebuild_gas_checkbuttons(preserve=False)
 
         # Parameter sliders
         param_frame = ttk.LabelFrame(ctrl_frame, text=' Parameters ')
@@ -1292,6 +2602,33 @@ class Simulator2DTab(ttk.Frame):
             self.after_cancel(self._update_job)
         self._update_job = self.after(80, self._update_plot)
 
+    def _rebuild_gas_checkbuttons(self, preserve=True):
+        previous = {k: v.get() for k, v in self.gas_vars.items()} if preserve else {}
+        for child in self.gas_list_frame.winfo_children():
+            child.destroy()
+        self.gas_vars = {}
+        self.gas_checks = {}
+        keys = get_gas_palette_keys(self.palette_mode_var.get())
+        default_selected = {'N2', 'He', 'Ar', 'Xe'}
+        for key in keys:
+            gas = GAS_DATA[key]
+            selected = previous.get(key, key in default_selected)
+            var = tk.BooleanVar(value=selected)
+            cb = ttk.Checkbutton(self.gas_list_frame,
+                                 text=f"{gas.get('symbol', key)} ({gas.get('name', key)})",
+                                 variable=var, command=self._schedule_update,
+                                 style='TCheckbutton')
+            cb.pack(anchor='w', padx=8, pady=1)
+            self.gas_vars[key] = var
+            self.gas_checks[key] = cb
+        if keys and not any(v.get() for v in self.gas_vars.values()):
+            self.gas_vars['N2' if 'N2' in self.gas_vars else keys[0]].set(True)
+        if hasattr(self, 'ax'):
+            self._schedule_update()
+
+    def on_gas_palette_changed(self):
+        self._rebuild_gas_checkbuttons(preserve=True)
+
     def _sync_temperature_unit_display(self):
         t_unit = get_temperature_unit()
         self.sl_T1.set_value_formatter(lambda v: format_temperature(v, t_unit, fmt='{:.1f}'))
@@ -1312,13 +2649,13 @@ class Simulator2DTab(ttk.Frame):
             self.fig.patch.set_facecolor(COLORS['bg_card'])
             cfg = self._get_config()
             aN2 = self.sl_aN2.get()
-            pressures = np.logspace(-2, 5, 300)
+            pressures = np.logspace(-2, 5, self.PRESSURE_POINTS)
 
             unit = get_pressure_unit()
             uf = PRESSURE_UNITS[unit]['factor']
             p_display = pressures * uf
 
-            selected = [k for k, v in self.gas_vars.items() if v.get()]
+            selected = [k for k, v in self.gas_vars.items() if v.get() and k in GAS_DATA]
             show_regimes = self.show_regimes_var.get()
             show_p0 = self.show_p0_var.get()
 
@@ -1360,7 +2697,7 @@ class Simulator2DTab(ttk.Frame):
                 spine.set_color(COLORS['border'])
 
             if show_regimes:
-                regime_txt = '—— combined  - - molecular  ···· viscous(+conv)' if cfg['geometry'] == 'cylindrical' else '—— combined  - - molecular  ···· viscous'
+                regime_txt = '—— combined  - - molecular  ···· viscous(+gravity/conv)'
                 self.ax.text(0.98, 0.02, regime_txt,
                              transform=self.ax.transAxes, ha='right', fontsize=8,
                              color=COLORS['text_dim'])
@@ -1374,6 +2711,10 @@ class Simulator2DTab(ttk.Frame):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class Simulator3DTab(ttk.Frame):
+    SURFACE_GRID = 30
+    GAS_COMPARE_POINTS = 56
+    MOL_VISC_POINTS = 64
+
     def __init__(self, parent):
         super().__init__(parent)
         self._update_job = None
@@ -1403,14 +2744,24 @@ class Simulator3DTab(ttk.Frame):
                             style='TCheckbutton').pack(anchor='w', padx=8, pady=2)
 
         # Gas selector for 3D
-        gas_frame = ttk.LabelFrame(ctrl_frame, text=' Primary Gas ')
-        gas_frame.pack(fill='x', pady=(0, 8))
+        self.gas_frame = ttk.LabelFrame(ctrl_frame, text=' Primary Gas ')
+        self.gas_frame.pack(fill='x', pady=(0, 8))
 
+        palette_row = ttk.Frame(self.gas_frame, style='Card.TFrame')
+        palette_row.pack(fill='x', padx=8, pady=(6, 2))
+        ttk.Label(palette_row, text='Palette', style='Card.TLabel').pack(side='left')
+        self.palette_mode_var = tk.StringVar(value='default')
+        palette_combo = ttk.Combobox(palette_row, textvariable=self.palette_mode_var,
+                                     values=['default', 'custom'], state='readonly', width=9)
+        palette_combo.pack(side='left', padx=(6, 4))
+        palette_combo.bind('<<ComboboxSelected>>', lambda e: self._rebuild_gas_radios())
+        ttk.Button(palette_row, text='Edit Custom',
+                   command=lambda: open_gas_palette_dialog(self, self.on_gas_palette_changed)).pack(side='right')
+
+        self.gas_radio_frame = ttk.Frame(self.gas_frame, style='Card.TFrame')
+        self.gas_radio_frame.pack(fill='x', padx=4, pady=(2, 6))
         self.gas_3d_var = tk.StringVar(value='Ar')
-        for key, gas in GAS_DATA.items():
-            ttk.Radiobutton(gas_frame, text=f"{gas['symbol']}", variable=self.gas_3d_var,
-                            value=key, command=self._schedule_update,
-                            style='TCheckbutton').pack(anchor='w', padx=8, pady=1)
+        self._rebuild_gas_radios(preserve=False)
 
         # Config selector
         cfg_frame = ttk.LabelFrame(ctrl_frame, text=' Configuration ')
@@ -1460,6 +2811,26 @@ class Simulator3DTab(ttk.Frame):
             self.after_cancel(self._update_job)
         self._update_job = self.after(90, self._update_plot)
 
+    def _rebuild_gas_radios(self, preserve=True):
+        current = self.gas_3d_var.get() if preserve else 'Ar'
+        for child in self.gas_radio_frame.winfo_children():
+            child.destroy()
+        keys = get_gas_palette_keys(self.palette_mode_var.get())
+        if current not in keys:
+            current = 'Ar' if 'Ar' in keys else ('N2' if 'N2' in keys else keys[0])
+        self.gas_3d_var.set(current)
+        for key in keys:
+            gas = GAS_DATA[key]
+            ttk.Radiobutton(self.gas_radio_frame, text=f"{gas.get('symbol', key)}",
+                            variable=self.gas_3d_var, value=key,
+                            command=self._schedule_update,
+                            style='TCheckbutton').pack(anchor='w', padx=8, pady=1)
+        if hasattr(self, 'ax'):
+            self._schedule_update()
+
+    def on_gas_palette_changed(self):
+        self._rebuild_gas_radios(preserve=True)
+
     def on_theme_changed(self):
         self.fig.patch.set_facecolor(COLORS['bg_card'])
 
@@ -1473,6 +2844,9 @@ class Simulator3DTab(ttk.Frame):
 
             mode = self.mode_var.get()
             gas_key = self.gas_3d_var.get()
+            if gas_key not in GAS_DATA:
+                gas_key = 'N2'
+                self.gas_3d_var.set(gas_key)
             cfg_key = self.cfg_3d_var.get()
             cfg = dict(GAUGE_CONFIGS[cfg_key])
             cmap_name = self.cmap_var.get()
@@ -1506,8 +2880,8 @@ class Simulator3DTab(ttk.Frame):
             self.canvas.draw_idle()
 
     def _plot_pressure_accommodation(self, cfg, gas_key, cmap_name, wireframe):
-        P = np.logspace(-1, 4, 36)
-        A = np.linspace(0.1, 1.0, 36)
+        P = np.logspace(-1, 4, self.SURFACE_GRID)
+        A = np.linspace(0.1, 1.0, self.SURFACE_GRID)
         PP, AA = np.meshgrid(np.log10(P), A)
         Z = np.zeros_like(PP)
 
@@ -1527,8 +2901,8 @@ class Simulator3DTab(ttk.Frame):
         self.fig.colorbar(surf, ax=self.ax, shrink=0.5, aspect=15, label='Q (mW)')
 
     def _plot_pressure_temperature(self, cfg, gas_key, cmap_name, wireframe):
-        P = np.logspace(-1, 4, 36)
-        T = np.linspace(313, 573, 36)
+        P = np.logspace(-1, 4, self.SURFACE_GRID)
+        T = np.linspace(313, 573, self.SURFACE_GRID)
         PP, TT = np.meshgrid(np.log10(P), T)
         Z = np.zeros_like(PP)
 
@@ -1550,11 +2924,11 @@ class Simulator3DTab(ttk.Frame):
         self.fig.colorbar(surf, ax=self.ax, shrink=0.5, aspect=15, label='Q (mW)')
 
     def _plot_pressure_gap(self, cfg, gas_key, cmap_name, wireframe):
-        P = np.logspace(-1, 4, 36)
+        P = np.logspace(-1, 4, self.SURFACE_GRID)
         if cfg['geometry'] in ('cylindrical', 'square_cavity'):
-            G = np.linspace(2, 30, 36)  # enclosure radius in mm
+            G = np.linspace(2, 30, self.SURFACE_GRID)  # enclosure radius in mm
         else:
-            G = np.linspace(0.002, 5, 36)  # gap in mm
+            G = np.linspace(0.002, 5, self.SURFACE_GRID)  # gap in mm
         PP, GG = np.meshgrid(np.log10(P), G)
         Z = np.zeros_like(PP)
 
@@ -1580,18 +2954,12 @@ class Simulator3DTab(ttk.Frame):
         self.fig.colorbar(surf, ax=self.ax, shrink=0.5, aspect=15, label='Q (mW)')
 
     def _plot_gas_comparison(self, cfg, cmap_name):
-        gases = list(GAS_DATA.keys())
-        P = np.logspace(-1, 4, 60)
+        gases = get_gas_palette_keys(self.palette_mode_var.get())
+        P = np.logspace(-1, 5.2, self.GAS_COMPARE_POINTS)
         Z = np.zeros((len(gases), len(P)))
 
-        Qn2_all, _, _ = calc_heat_flow_vec('N2', cfg, P, 0.6)
         for i, gk in enumerate(gases):
-            Qx_all, _, _ = calc_heat_flow_vec(gk, cfg, P, 0.6)
-            safe = np.where(Qx_all > 0, Qx_all, 1e-30)
-            Z[i, :] = np.where(Qx_all > 0, Qn2_all / safe, 0)
-
-        X, Y = np.meshgrid(np.log10(P), np.arange(len(gases)))
-        colors = [GAS_DATA[g]['color'] for g in gases]
+            Z[i, :] = calc_correction_factor_curve_physics(gk, cfg, P, 0.6)
 
         for i, gk in enumerate(gases):
             self.ax.plot(np.log10(P), [i]*len(P), Z[i, :],
@@ -1602,17 +2970,17 @@ class Simulator3DTab(ttk.Frame):
         self.ax.set_zlabel('CF_X/N₂', fontsize=9, labelpad=10)
         self.ax.set_yticks(range(len(gases)))
         self.ax.set_yticklabels([GAS_DATA[g]['symbol'] for g in gases], fontsize=7)
-        self.ax.set_title('Correction Factors — All Gases vs Pressure',
+        self.ax.set_title(f'Pressure-Dependent Correction Factors — {cfg.get("name", "Gauge")}',
                           fontsize=11, color=COLORS['text_bright'], pad=15)
         self.ax.legend(fontsize=7, loc='upper left')
 
     def _plot_mol_vs_visc(self, cfg, gas_key, cmap_name, wireframe):
-        P = np.logspace(-1, 5, 80)
+        P = np.logspace(-1, 5, self.MOL_VISC_POINTS)
         gas = GAS_DATA[gas_key]
         Q_arr, Qm_arr, Qv_arr = calc_heat_flow_vec(gas_key, cfg, P, 0.6)
-        Qs = (Q_arr * 1000).tolist()
-        Qms = (Qm_arr * 1000).tolist()
-        Qvs = (Qv_arr * 1000).tolist()
+        Qs = Q_arr * 1000
+        Qms = Qm_arr * 1000
+        Qvs = Qv_arr * 1000
 
         logP = np.log10(P)
         zeros = np.zeros_like(logP)
@@ -1620,17 +2988,6 @@ class Simulator3DTab(ttk.Frame):
         self.ax.plot(logP, zeros, Qms, color='#4fc3f7', linewidth=2.5, label='Molecular (Q_mol)')
         self.ax.plot(logP, np.ones_like(logP), Qvs, color='#e67e22', linewidth=2.5, label='Viscous (Q_visc)')
         self.ax.plot(logP, np.ones_like(logP)*2, Qs, color='#6bcb77', linewidth=3, label='Combined')
-
-        # Fill surfaces
-        for i in range(len(logP)-1):
-            verts = [[logP[i], 0, 0], [logP[i], 0, Qms[i]],
-                     [logP[i+1], 0, Qms[i+1]], [logP[i+1], 0, 0]]
-            self.ax.plot_surface(
-                np.array([[logP[i], logP[i+1]], [logP[i], logP[i+1]]]),
-                np.array([[0, 0], [0, 0]]),
-                np.array([[0, 0], [Qms[i], Qms[i+1]]]),
-                color='#4fc3f7', alpha=0.1
-            )
 
         self.ax.set_xlabel('log₁₀(P / Pa)', fontsize=9, labelpad=10)
         self.ax.set_ylabel('Regime', fontsize=9, labelpad=10)
@@ -1988,21 +3345,18 @@ class GasExplorerTab(ttk.Frame):
                             style='TCheckbutton').pack(anchor='w', padx=8, pady=2)
 
         # Data table
-        table_frame = ttk.LabelFrame(ctrl_frame, text=' Gas Properties (Table I) ')
+        table_frame = ttk.LabelFrame(ctrl_frame, text=' Gas Properties ')
         table_frame.pack(fill='both', expand=True, pady=(0, 8))
 
-        cols = ('gas', 'm', 'f', 'gamma', 'cbar', 'plbar')
+        cols = ('gas', 'm', 'f', 'gamma', 'cbar', 'plbar', 'source')
         self.tree = ttk.Treeview(table_frame, columns=cols, show='headings', height=9)
-        headers = {'gas': 'Gas', 'm': 'Mass', 'f': 'DOF', 'gamma': 'γ', 'cbar': 'c̄', 'plbar': 'p·λ̄'}
+        headers = {'gas': 'Gas', 'm': 'Mass', 'f': 'DOF', 'gamma': 'γ', 'cbar': 'c̄', 'plbar': 'p·λ̄', 'source': 'Source'}
         for c in cols:
             self.tree.heading(c, text=headers[c])
-            self.tree.column(c, width=55)
+            self.tree.column(c, width=90 if c == 'source' else 55)
         self.tree.pack(padx=4, pady=4, fill='both', expand=True)
 
-        for key, g in GAS_DATA.items():
-            self.tree.insert('', 'end', values=(
-                g['symbol'], g['m'], g['f'], g['gamma'],
-                g['cbar'], f"{g['plbar']*1000:.1f}"))
+        self._refresh_table()
 
         plot_frame = ttk.Frame(self)
         plot_frame.pack(side='right', fill='both', expand=True, padx=8, pady=8)
@@ -2020,6 +3374,19 @@ class GasExplorerTab(ttk.Frame):
 
     def on_theme_changed(self):
         self.fig.patch.set_facecolor(COLORS['bg_card'])
+
+    def on_gas_palette_changed(self):
+        self._refresh_table()
+        self._update_plot()
+
+    def _refresh_table(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        for key, g in GAS_DATA.items():
+            src = _gas_source_label(g)
+            self.tree.insert('', 'end', values=(
+                g.get('symbol', key), g.get('m'), g.get('f'), g.get('gamma'),
+                g.get('cbar'), f"{float(g.get('plbar', 0.0))*1000:.1f}", src))
 
     def _update_plot(self, *args):
         with plt.rc_context(MPL_STYLE):
@@ -2080,11 +3447,11 @@ class CalculatorTab(ttk.Frame):
         row1.pack(fill='x', padx=8, pady=4)
         ttk.Label(row1, text='Gas Species:').pack(side='left')
         self.calc_gas = tk.StringVar(value='Ar')
-        gas_combo = ttk.Combobox(row1, textvariable=self.calc_gas,
-                                 values=[f"{GAS_DATA[k]['symbol']} ({k})" for k in GAS_DATA],
-                                 state='readonly', width=20)
-        gas_combo.pack(side='right')
-        gas_combo.bind('<<ComboboxSelected>>', self._calc_correction)
+        self.gas_combo = ttk.Combobox(row1, textvariable=self.calc_gas,
+                          values=[_gas_combo_label(k) for k in get_all_simulation_gas_keys()],
+                          state='readonly', width=20)
+        self.gas_combo.pack(side='right')
+        self.gas_combo.bind('<<ComboboxSelected>>', self._calc_correction)
 
         row2 = ttk.Frame(cf_frame)
         row2.pack(fill='x', padx=8, pady=4)
@@ -2133,9 +3500,9 @@ class CalculatorTab(ttk.Frame):
             var = tk.StringVar(value=default)
             self.ht_vars[var_name] = var
             if var_name == 'ht_gas':
-                combo = ttk.Combobox(row, textvariable=var,
-                                     values=list(GAS_DATA.keys()), state='readonly', width=10)
-                combo.pack(side='right')
+                self.ht_gas_combo = ttk.Combobox(row, textvariable=var,
+                                                 values=get_all_simulation_gas_keys(), state='readonly', width=10)
+                self.ht_gas_combo.pack(side='right')
             else:
                 ttk.Entry(row, textvariable=var, width=10).pack(side='right')
 
@@ -2165,7 +3532,22 @@ class CalculatorTab(ttk.Frame):
             self.ref_cards.append((key, direction, range_lbl))
 
         # Initial unit sync
+        self._refresh_gas_options()
         self._sync_unit_labels()
+
+    def on_gas_palette_changed(self):
+        self._refresh_gas_options()
+
+    def _refresh_gas_options(self):
+        keys = get_all_simulation_gas_keys()
+        self.gas_combo.configure(values=[_gas_combo_label(k) for k in keys])
+        if _gas_key_from_combo(self.calc_gas.get(), fallback='Ar') not in GAS_DATA:
+            self.calc_gas.set(_gas_combo_label('Ar' if 'Ar' in GAS_DATA else keys[0]))
+        elif self.calc_gas.get() in GAS_DATA:
+            self.calc_gas.set(_gas_combo_label(self.calc_gas.get()))
+        self.ht_gas_combo.configure(values=keys)
+        if self.ht_vars['ht_gas'].get() not in GAS_DATA:
+            self.ht_vars['ht_gas'].set('N2' if 'N2' in GAS_DATA else keys[0])
 
     def _sync_unit_labels(self):
         """Update all labels and reference cards to reflect current units."""
@@ -2194,11 +3576,7 @@ class CalculatorTab(ttk.Frame):
             range_lbl.config(text=f"  {direction}  |  Range: {range_str}")
 
     def _get_gas_key(self):
-        val = self.calc_gas.get()
-        for key in GAS_DATA:
-            if key in val:
-                return key
-        return 'N2'
+        return _gas_key_from_combo(self.calc_gas.get(), fallback='N2')
 
     def _calc_correction(self, *args):
         self._sync_unit_labels()
@@ -2207,8 +3585,9 @@ class CalculatorTab(ttk.Frame):
             p_ind_user = float(self.calc_pind.get())
             unit = get_pressure_unit()
             ulbl = PRESSURE_UNITS[unit]['label']
-            cf = EXPERIMENTAL_CF[key]['mean']
-            spread = EXPERIMENTAL_CF[key]['spread']
+            cf_data = EXPERIMENTAL_CF.get(key, {'mean': calc_correction_factor_theory(key), 'spread': 0.0})
+            cf = cf_data['mean']
+            spread = cf_data['spread']
             p_true = p_ind_user * cf
             p_min = p_ind_user * (cf - spread)
             p_max = p_ind_user * (cf + spread)
@@ -2303,7 +3682,7 @@ class LearnTab(ttk.Frame):
              "• Q̇_gas — Heat carried by gas molecules (PRESSURE-DEPENDENT signal)\n"
              "• Q̇_supp — Heat conducted through wire supports (fixed offset)\n"
              "• Q̇_rad — Thermal radiation from the hot wire (fixed offset)\n"
-             "• Q̇_conv — Convection (significant only at high pressure)\n\n"
+             "• Q̇_conv — Buoyancy/natural convection from gravity, gas transport, and geometry at higher pressure\n\n"
              "The 'zero offset' p₀ = Q̇_supp + Q̇_rad is set during gauge calibration."),
 
             ("Molecular Regime — Low Pressure (Eq. 3)",
@@ -2331,7 +3710,8 @@ class LearnTab(ttk.Frame):
              "Different gases have different:\n"
              "• Accommodation coefficients (aE) — energy transfer efficiency at surfaces\n"
              "• Degrees of freedom (f) — monatomic: 3, diatomic: 5, polyatomic: 6+\n"
-             "• Mean velocity (c̄) — lighter = faster (H₂: 1764 m/s vs Xe: 219 m/s)\n\n"
+             "• Mean velocity (c̄) — lighter = faster (H₂: 1764 m/s vs Xe: 219 m/s)\n"
+             "• High-pressure convection behavior — viscosity, thermal conductivity, density, gravity, and gauge orientation\n\n"
              "The molecular regime ratio Q̇_N₂/Q̇_X gives the correction factor.\n"
              "KEY FINDING: Correction factors vary 10-20% between gauges because\n"
              "the accommodation coefficient depends on BOTH gas AND surface condition."),
@@ -2472,7 +3852,7 @@ class GeometryViewerTab(ttk.Frame):
                 self._draw_plates(pressure, cfg)
 
             self.fig.tight_layout()
-            self.canvas.draw()
+            self.canvas.draw_idle()
 
     def _draw_cylindrical(self, pressure, cfg):
         ax = self.fig.add_subplot(121)
@@ -2725,13 +4105,16 @@ class MolecularSimTab(ttk.Frame):
     # ── Animation ────────────────────────────────────────────────────────────
     DT = 0.04              # simulation timestep (s)
     INTERVAL = 33          # ms between frames (~30 fps)
-    DRAW_EVERY = 3         # draw every N physics steps
+    DRAW_EVERY = 5         # draw every N physics steps
 
     # ── Molecule visuals ─────────────────────────────────────────────────────
     MOL_SPEED_BASE = 4.0   # display speed for N₂ (units / s)
-    MOL_SIZE_BASE = 60     # scatter marker size for N₂
+    MOL_SIZE_BASE = 46     # scatter marker size for N₂
     MOLECULES_PER_PARTICLE = 3.0e16  # real molecules represented by one visual particle
-    TRAIL_LENGTH = 12      # stored positions per particle for trajectory trails
+    TRAIL_LENGTH = 8       # stored positions per particle for trajectory trails
+    MAX_VISUAL_MOLECULES = 260
+    MAX_TRAIL_PARTICLES = 90
+    MAX_VECTOR_PARTICLES = 90
     MOL_COLLISION_RADIUS = 0.22   # display-units proximity for molecule collisions
     MOL_MM_RELAX = 0.28           # temperature exchange fraction per molecule collision
     PIRANI_AVG_WINDOW = 50        # default rolling average window (measurements)
@@ -2790,20 +4173,27 @@ class MolecularSimTab(ttk.Frame):
         self.mol_pos = np.zeros((0, 3))
         self.mol_vel = np.zeros((0, 3))
         self.mol_gas_keys = []  # per-molecule gas species key
+        self.mol_gas_key_array = np.array([], dtype=object)
+        self.mol_group_indices = {}
         # Precomputed per-molecule physics arrays (set in _init_molecules)
         self.mol_aE = np.zeros(0)
         self.mol_f_plus1 = np.zeros(0)
         self.mol_thermal_speed = np.zeros(0)  # Rayleigh scale at T_COLD
+        self.mol_conv_response = np.zeros(0)
         self.molecules_per_particle = self.MOLECULES_PER_PARTICLE
         self.mol_trail_pos = np.zeros((0, self.TRAIL_LENGTH, 3))
         self.mol_trail_temp = np.zeros((0, self.TRAIL_LENGTH))
         self.pirani_readings_pa = deque(maxlen=self.PIRANI_AVG_WINDOW)
+        self._bridge_calibration_cache = {}
 
         self._elev = 20
         self._azim = -60
         self._camera_preset_pending = False  # flag to skip reading axes on next draw
         self._pending_reinit_job = None
         self._pending_reinit_draw = False
+        self._syncing_mix_fields = False
+        self._last_edited_gas_key = None
+        self.auto_normalize_var = tk.BooleanVar(value=True)
 
         self._build_ui()
         self._on_config_change()
@@ -2823,9 +4213,20 @@ class MolecularSimTab(ttk.Frame):
         mix_frame = ttk.LabelFrame(ctrl, text='  Gas Mixture  ')
         mix_frame.pack(fill='x', pady=(0, 6))
 
+        palette_row = ttk.Frame(mix_frame, style='Card.TFrame')
+        palette_row.pack(fill='x', padx=8, pady=(6, 2))
+        ttk.Label(palette_row, text='Palette', style='Card.TLabel').pack(side='left')
+        self.palette_mode_var = tk.StringVar(value='default')
+        palette_combo = ttk.Combobox(palette_row, textvariable=self.palette_mode_var,
+                         values=['default', 'custom'], state='readonly', width=9)
+        palette_combo.pack(side='left', padx=(6, 4))
+        palette_combo.bind('<<ComboboxSelected>>', self._on_palette_mode_change)
+        ttk.Button(palette_row, text='Edit Custom',
+               command=lambda: open_gas_palette_dialog(self, self.on_gas_palette_changed)).pack(side='right')
+
         # Preset combobox
         preset_row = ttk.Frame(mix_frame, style='Card.TFrame')
-        preset_row.pack(fill='x', padx=8, pady=(6, 2))
+        preset_row.pack(fill='x', padx=8, pady=(2, 2))
         ttk.Label(preset_row, text='Preset', style='Card.TLabel').pack(side='left')
         self.preset_var = tk.StringVar(value='pure_n2')
         preset_names = [v['name'] for v in GAS_MIXTURE_PRESETS.values()]
@@ -2843,31 +4244,8 @@ class MolecularSimTab(ttk.Frame):
         self.gas_pct_vars = {}
         self.gas_pct_entries = {}
         self._gas_dot_canvases = []  # tk.Canvas dots for per-gas color indicators
-        gas_grid = ttk.Frame(mix_frame, style='Card.TFrame')
-        gas_grid.pack(fill='x', padx=6, pady=(0, 4))
-
-        for i, (key, gas) in enumerate(GAS_DATA.items()):
-            row = ttk.Frame(gas_grid, style='Card.TFrame')
-            row.pack(fill='x', pady=1)
-
-            # Color dot via a small canvas
-            dot = tk.Canvas(row, width=10, height=10, bg=COLORS['bg_card'],
-                            highlightthickness=0)
-            dot.create_oval(1, 1, 9, 9, fill=gas['color'], outline='')
-            dot.pack(side='left', padx=(4, 4))
-            self._gas_dot_canvases.append(dot)
-
-            ttk.Label(row, text=f"{gas['symbol']}", style='Card.TLabel',
-                      width=4).pack(side='left')
-
-            var = tk.StringVar(value='0')
-            entry = ttk.Entry(row, textvariable=var, width=5, justify='right')
-            entry.pack(side='right', padx=(0, 4))
-            entry.bind('<KeyRelease>', self._on_ratio_change)
-            ttk.Label(row, text='%', style='Dim.TLabel').pack(side='right')
-
-            self.gas_pct_vars[key] = var
-            self.gas_pct_entries[key] = entry
+        self.gas_grid = ttk.Frame(mix_frame, style='Card.TFrame')
+        self.gas_grid.pack(fill='x', padx=6, pady=(0, 4))
 
         # Total & normalize
         total_row = ttk.Frame(mix_frame, style='Card.TFrame')
@@ -2875,14 +4253,17 @@ class MolecularSimTab(ttk.Frame):
         self.total_label = ttk.Label(total_row, text='Total: 0 %',
                                      style='Accent.TLabel')
         self.total_label.pack(side='left')
-        ttk.Button(total_row, text='Normalize',
-                   command=self._normalize_ratios).pack(side='right')
+        self.normalize_btn = ttk.Button(total_row, text='Normalize: On',
+                        command=self._toggle_auto_normalize)
+        self.normalize_btn.pack(side='right')
+        self._update_normalize_button()
 
         # Composition bar (tiny matplotlib)
         self.comp_fig = Figure(figsize=(2.6, 0.3), dpi=100)
         self.comp_fig.patch.set_facecolor(COLORS['bg_card'])
         self.comp_canvas = FigureCanvasTkAgg(self.comp_fig, master=mix_frame)
         self.comp_canvas.get_tk_widget().pack(fill='x', padx=6, pady=(0, 6))
+        self._rebuild_mixture_gas_rows(preserve=False)
 
         # Gauge configuration
         cfg_frame = ttk.LabelFrame(ctrl, text=' Gauge ')
@@ -2909,6 +4290,10 @@ class MolecularSimTab(ttk.Frame):
         ttk.Checkbutton(vis_frame, text='Show particle temp trails',
                 variable=self.show_temp_trails,
                 command=lambda: self._draw_scene()).pack(anchor='w', padx=8, pady=1)
+        self.show_center_of_mass = tk.BooleanVar(value=False)
+        ttk.Checkbutton(vis_frame, text='Show gas centers of mass',
+            variable=self.show_center_of_mass,
+            command=lambda: self._draw_scene()).pack(anchor='w', padx=8, pady=1)
 
         avg_frame = ttk.LabelFrame(ctrl, text=' Pressure Averaging ')
         avg_frame.pack(fill='x', pady=(0, 6))
@@ -2937,12 +4322,12 @@ class MolecularSimTab(ttk.Frame):
         cmap_combo.pack(padx=8, pady=2, anchor='w')
         cmap_combo.bind('<<ComboboxSelected>>', lambda e: self._on_color_range_change())
 
-        self.sl_color_min = LabeledSlider(color_frame, 'Color Min Temp (K)', 200, 500, 388,
+        self.sl_color_min = LabeledSlider(color_frame, 'Color Min Temp (K)', 200, 500, 390,
                                           fmt='{:.0f}', unit='K',
                                           command=lambda v: self._on_color_range_change())
         self.sl_color_min.pack(fill='x', padx=6, pady=2)
 
-        self.sl_color_max = LabeledSlider(color_frame, 'Color Max Temp (K)', 300, 700, 394,
+        self.sl_color_max = LabeledSlider(color_frame, 'Color Max Temp (K)', 300, 700, 396,
                                           fmt='{:.0f}', unit='K',
                                           command=lambda v: self._on_color_range_change())
         self.sl_color_max.pack(fill='x', padx=6, pady=2)
@@ -2950,7 +4335,7 @@ class MolecularSimTab(ttk.Frame):
         self.auto_color_scale_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             color_frame,
-            text='Auto-scale to gauge temperatures',
+            text='Auto-scale to filament ±3 °C',
             variable=self.auto_color_scale_var,
             command=lambda: self._auto_update_color_range(force=True),
             style='TCheckbutton',
@@ -2992,6 +4377,11 @@ class MolecularSimTab(ttk.Frame):
         self.stats_label = ttk.Label(stats_frame, text='', style='Dim.TLabel',
                                      wraplength=230, justify='left')
         self.stats_label.pack(padx=8, pady=4)
+
+        data_frame = ttk.LabelFrame(info, text=' Data ')
+        data_frame.pack(fill='x', pady=(0, 6))
+        ttk.Button(data_frame, text='Export CSV',
+               command=self._export_pressure_csv).pack(fill='x', padx=8, pady=6)
 
         # Temperature legend
         self.legend_frame = ttk.LabelFrame(info, text=' Filament Temperature ')
@@ -3118,8 +4508,8 @@ class MolecularSimTab(ttk.Frame):
             if color_min_k >= color_max_k:
                 color_max_k = color_min_k + 1.0
         else:
-            color_min_k = self.T_COLD - 5
-            color_max_k = self.T_HOT + 5
+            color_min_k = self.T_HOT - 3.0
+            color_max_k = self.T_HOT + 3.0
         cmap_name = self.filament_cmap_var.get() if hasattr(self, 'filament_cmap_var') else 'coolwarm'
         t_cold = convert_temperature(color_min_k, 'K', t_unit)
         t_hot = convert_temperature(color_max_k, 'K', t_unit)
@@ -3154,6 +4544,9 @@ class MolecularSimTab(ttk.Frame):
     def _get_gas(self):
         return GAS_DATA[self._get_gas_key()]
 
+    def _get_molecule_radius_pm(self, gas_key):
+        return self.MOL_RADII.get(gas_key, _estimate_molecular_radius_pm(gas_key))
+
     def _mol_count(self):
         """Number of visual molecules, proportional to pressure."""
         p_pa = 10 ** self.sl_pressure.get()
@@ -3162,7 +4555,7 @@ class MolecularSimTab(ttk.Frame):
         hi_log = np.log10(2000.0)
         frac = (np.log10(max(p_mbar, 1e-12)) - lo_log) / (hi_log - lo_log)
         frac = float(np.clip(frac, 0.0, 1.0))
-        n_min, n_max = 6, 520
+        n_min, n_max = 6, self.MAX_VISUAL_MOLECULES
         shaped = frac ** 1.15
         return int(round(n_min + shaped * (n_max - n_min)))
 
@@ -3172,7 +4565,164 @@ class MolecularSimTab(ttk.Frame):
         table = ACCOM_RATIOS_W if surface == 'W' else ACCOM_RATIOS_Si
         return min(0.6 * table.get(gas_key, 1.0), 1.0)
 
+    def _get_visual_convection_response(self, gas_key):
+        """Gas-specific response used by the visual buoyancy/convection animation."""
+        t_film = max(0.5 * (self.T_HOT + self.T_COLD), 180.0)
+        mu_g, k_g, cp_g, _ = _get_gas_transport(gas_key, t_film)
+        mu_ref, k_ref, cp_ref, _ = _get_gas_transport('N2', t_film)
+        m_ref = GAS_DATA['N2']['m'] / 1000.0
+        m_g = GAS_DATA[gas_key]['m'] / 1000.0
+        response = (
+            (k_g / max(k_ref, 1e-18)) ** 0.35 *
+            (mu_ref / max(mu_g, 1e-18)) ** 0.20 *
+            (cp_g / max(cp_ref, 1e-18)) ** 0.10 *
+            (m_ref / max(m_g, 1e-18)) ** 0.08
+        )
+        return float(np.clip(response, 0.45, 1.80))
+
     # ── Mixture management ───────────────────────────────────────────────────
+
+    def _active_mixture_keys(self):
+        return [k for k in get_gas_palette_keys(self.palette_mode_var.get()) if k in GAS_DATA]
+
+    def _rebuild_mixture_gas_rows(self, preserve=True):
+        previous = {}
+        if preserve:
+            for key, var in self.gas_pct_vars.items():
+                try:
+                    previous[key] = max(float(var.get()), 0.0)
+                except (ValueError, tk.TclError):
+                    previous[key] = 0.0
+
+        for child in self.gas_grid.winfo_children():
+            child.destroy()
+        self.gas_pct_vars = {}
+        self.gas_pct_entries = {}
+        self._gas_dot_canvases = []
+
+        for key in self._active_mixture_keys():
+            gas = GAS_DATA[key]
+            row = ttk.Frame(self.gas_grid, style='Card.TFrame')
+            row.pack(fill='x', pady=1)
+
+            dot = tk.Canvas(row, width=10, height=10, bg=COLORS['bg_card'], highlightthickness=0)
+            dot.create_oval(1, 1, 9, 9, fill=gas.get('color', COLORS['accent']), outline='')
+            dot.pack(side='left', padx=(4, 4))
+            self._gas_dot_canvases.append(dot)
+
+            ttk.Label(row, text=f"{gas.get('symbol', key)}", style='Card.TLabel', width=6).pack(side='left')
+
+            var = tk.StringVar(value=f"{previous.get(key, 0.0):.1f}" if previous.get(key, 0.0) else '0')
+            entry = ttk.Entry(row, textvariable=var, width=6, justify='right')
+            entry.pack(side='right', padx=(0, 4))
+            entry.bind('<KeyRelease>', lambda e, k=key: self._on_ratio_change(e, changed_key=k))
+            entry.bind('<FocusOut>', lambda e, k=key: self._on_ratio_change(e, changed_key=k))
+            ttk.Label(row, text='%', style='Dim.TLabel').pack(side='right')
+
+            self.gas_pct_vars[key] = var
+            self.gas_pct_entries[key] = entry
+
+        if self.gas_pct_vars:
+            total = sum(max(float(v.get()), 0.0) for v in self.gas_pct_vars.values() if self._is_float(v.get()))
+            if total <= 0.0:
+                key = 'N2' if 'N2' in self.gas_pct_vars else next(iter(self.gas_pct_vars))
+                self.gas_pct_vars[key].set('100.0')
+            self._force_mixture_total()
+        self._update_composition_display()
+
+    def _is_float(self, value):
+        try:
+            float(value)
+            return True
+        except (ValueError, TypeError, tk.TclError):
+            return False
+
+    def _set_pct_var(self, key, value):
+        if key in self.gas_pct_vars:
+            self.gas_pct_vars[key].set(f'{max(value, 0.0):.1f}' if value > 0 else '0')
+
+    def _auto_normalize_enabled(self):
+        var = getattr(self, 'auto_normalize_var', None)
+        return True if var is None else bool(var.get())
+
+    def _update_normalize_button(self):
+        if not hasattr(self, 'normalize_btn'):
+            return
+        if self._auto_normalize_enabled():
+            self.normalize_btn.config(text='Normalize: On', style='Active.TButton')
+        else:
+            self.normalize_btn.config(text='Normalize: Off', style='TButton')
+
+    def _toggle_auto_normalize(self):
+        self.auto_normalize_var.set(not self.auto_normalize_var.get())
+        if self._auto_normalize_enabled():
+            self._normalize_ratios()
+        else:
+            self._update_composition_display()
+        self._update_normalize_button()
+        self._schedule_molecule_reinit(draw_if_idle=True, delay_ms=60)
+
+    def _force_mixture_total(self, changed_key=None, force=False):
+        if self._syncing_mix_fields or not self.gas_pct_vars:
+            return
+        if not force and not self._auto_normalize_enabled():
+            return
+        self._syncing_mix_fields = True
+        try:
+            keys = list(self.gas_pct_vars.keys())
+            values = {}
+            for key in keys:
+                try:
+                    values[key] = max(float(self.gas_pct_vars[key].get()), 0.0)
+                except (ValueError, tk.TclError):
+                    values[key] = 0.0
+
+            if changed_key not in values:
+                changed_key = self._last_edited_gas_key if self._last_edited_gas_key in values else None
+
+            if changed_key is not None:
+                changed_val = min(values[changed_key], 100.0)
+                values[changed_key] = changed_val
+                others = [k for k in keys if k != changed_key]
+                remainder = max(100.0 - changed_val, 0.0)
+                other_sum = sum(values[k] for k in others)
+                if others:
+                    if other_sum > 1e-9:
+                        for key in others:
+                            values[key] = values[key] / other_sum * remainder
+                    else:
+                        share = remainder / len(others)
+                        for key in others:
+                            values[key] = share
+                else:
+                    values[changed_key] = 100.0
+            else:
+                total = sum(values.values())
+                if total <= 1e-9:
+                    first = 'N2' if 'N2' in values else keys[0]
+                    values = {k: (100.0 if k == first else 0.0) for k in keys}
+                else:
+                    values = {k: v / total * 100.0 for k, v in values.items()}
+
+            rounded = {k: round(v, 1) for k, v in values.items()}
+            diff = round(100.0 - sum(rounded.values()), 1)
+            if abs(diff) >= 0.1:
+                target = changed_key if changed_key in rounded else max(rounded, key=rounded.get)
+                rounded[target] = max(0.0, rounded[target] + diff)
+            for key, value in rounded.items():
+                self._set_pct_var(key, value)
+        finally:
+            self._syncing_mix_fields = False
+
+    def _on_palette_mode_change(self, event=None):
+        self._rebuild_mixture_gas_rows(preserve=True)
+        self.preset_var.set('custom')
+        self.preset_desc.config(text=GAS_MIXTURE_PRESETS['custom']['desc'])
+        self._schedule_molecule_reinit(draw_if_idle=True, delay_ms=60)
+
+    def on_gas_palette_changed(self):
+        self._rebuild_mixture_gas_rows(preserve=True)
+        self._schedule_molecule_reinit(draw_if_idle=True, delay_ms=60)
 
     def _get_mixture_fractions(self):
         """Return normalised dict {gas_key: fraction 0-1} from entry fields."""
@@ -3197,8 +4747,9 @@ class MolecularSimTab(ttk.Frame):
         self.preset_var.set(preset_key)
         self.preset_desc.config(text=preset['desc'])
         mix = preset['mix']
-        for key in GAS_DATA:
+        for key in self.gas_pct_vars:
             self.gas_pct_vars[key].set(str(mix.get(key, 0)))
+        self._force_mixture_total()
         self._update_composition_display()
 
     def _on_preset_change(self, event=None):
@@ -3206,7 +4757,11 @@ class MolecularSimTab(ttk.Frame):
         self._apply_preset(key)
         self._schedule_molecule_reinit(draw_if_idle=True, delay_ms=30)
 
-    def _on_ratio_change(self, event=None):
+    def _on_ratio_change(self, event=None, changed_key=None):
+        if self._syncing_mix_fields:
+            return
+        self._last_edited_gas_key = changed_key
+        self._force_mixture_total(changed_key=changed_key)
         self._update_composition_display()
         # Switch preset label to Custom if user edits
         self.preset_var.set('custom')
@@ -3216,9 +4771,10 @@ class MolecularSimTab(ttk.Frame):
     def _normalize_ratios(self):
         """Scale entries so they sum to 100 %."""
         fracs = self._get_mixture_fractions()
-        for key in GAS_DATA:
+        for key in self.gas_pct_vars:
             pct = fracs.get(key, 0.0) * 100
             self.gas_pct_vars[key].set(f'{pct:.1f}' if pct > 0 else '0')
+        self._force_mixture_total(force=True)
         self._update_composition_display()
 
     def _update_composition_display(self):
@@ -3229,8 +4785,8 @@ class MolecularSimTab(ttk.Frame):
                 total += float(var.get())
             except (ValueError, tk.TclError):
                 pass
-        c = COLORS['accent2'] if abs(total - 100) < 0.5 else COLORS['warn']
-        self.total_label.config(text=f'Total: {total:.1f} %')
+        c = COLORS['accent2'] if abs(total - 100) < 0.05 else COLORS['warn']
+        self.total_label.config(text=f'Total: {total:.1f} %', foreground=c)
 
         # Stacked bar
         self.comp_fig.clear()
@@ -3251,6 +4807,109 @@ class MolecularSimTab(ttk.Frame):
                         color='white', fontweight='bold')
             left += frac
         self.comp_canvas.draw_idle()
+
+    def _get_raw_mixture_percentages(self):
+        raw = {}
+        for key, var in self.gas_pct_vars.items():
+            try:
+                value = max(float(var.get()), 0.0)
+            except (ValueError, tk.TclError):
+                value = 0.0
+            if value > 0.0:
+                raw[key] = value
+        return raw
+
+    def _format_mixture_for_export(self, values):
+        if not values:
+            return 'N2 100%'
+        parts = []
+        for key, value in sorted(values.items(), key=lambda item: -item[1]):
+            gas = GAS_DATA.get(key, {})
+            label = gas.get('symbol', key)
+            parts.append(f'{label} {value:.4g}%')
+        return '; '.join(parts)
+
+    def _export_pressure_csv(self):
+        cfg = self._get_active_sim_config()
+        cfg_name = cfg.get('name', self.cfg_var.get())
+        initial_name = re.sub(r'[^A-Za-z0-9_.-]+', '_', f'pirani_{self.cfg_var.get()}_export').strip('_')
+        path = filedialog.asksaveasfilename(
+            parent=self.winfo_toplevel(),
+            title='Export Simulation CSV',
+            defaultextension='.csv',
+            initialfile=f'{initial_name}.csv',
+            filetypes=[('CSV files', '*.csv'), ('All files', '*.*')],
+        )
+        if not path:
+            return
+
+        try:
+            rows = self._build_pressure_export_rows(cfg)
+            with open(path, 'w', newline='', encoding='utf-8') as fh:
+                writer = csv.writer(fh)
+                writer.writerows(rows)
+            messagebox.showinfo('Export CSV', f'Exported {cfg_name} simulation data to:\n{path}',
+                                parent=self.winfo_toplevel())
+        except Exception as exc:
+            messagebox.showwarning('Export CSV', f'Could not export simulation data:\n{exc}',
+                                   parent=self.winfo_toplevel())
+
+    def _build_pressure_export_rows(self, cfg):
+        unit = get_pressure_unit()
+        unit_label = PRESSURE_UNITS[unit]['label']
+        unit_factor = PRESSURE_UNITS[unit]['factor']
+        t_unit = get_temperature_unit()
+        raw_mix = self._get_raw_mixture_percentages()
+        raw_total = sum(raw_mix.values())
+        fracs = self._get_mixture_fractions()
+        mix_pct_used = {key: value * 100.0 for key, value in fracs.items()}
+        aN2 = self._get_nominal_aN2(cfg)
+
+        range_lo_mbar, range_hi_mbar = cfg.get('range_mbar', (1e-4, 1000.0))
+        p_min_pa = max(float(range_lo_mbar) * 100.0, 1e-12)
+        p_max_pa = max(float(range_hi_mbar) * 100.0, p_min_pa * 10.0)
+        sample_count = 160
+        real_pressures_pa = np.logspace(np.log10(p_min_pa), np.log10(p_max_pa), sample_count)
+        measured_pressures_pa = calc_mixture_indicated_pressure_curve_physics(
+            fracs,
+            cfg,
+            real_pressures_pa,
+            aN2=aN2,
+        )
+
+        rows = [
+            ['Pirani Vacuum Gauge Simulator Export'],
+            ['Exported at', time.strftime('%Y-%m-%d %H:%M:%S')],
+            ['Gauge', cfg.get('name', self.cfg_var.get())],
+            ['Geometry', cfg.get('geometry', '')],
+            ['Surface', cfg.get('surface', '')],
+            ['Pressure unit', unit_label],
+            ['Temperature unit', TEMPERATURE_UNITS[t_unit]['label']],
+            ['Auto normalize mixture', 'On' if self._auto_normalize_enabled() else 'Off'],
+            ['Raw mixture total percent', f'{raw_total:.6g}'],
+            ['Raw mixture entries', self._format_mixture_for_export(raw_mix)],
+            ['Simulation mixture used', self._format_mixture_for_export(mix_pct_used)],
+            ['Filament temperature K', f'{self.T_HOT:.12g}'],
+            ['Environment temperature K', f'{self.T_COLD:.12g}'],
+            ['Current pressure setpoint Pa', f'{10 ** self.sl_pressure.get():.12g}'],
+            ['Gauge range mbar', f'{range_lo_mbar:.12g} to {range_hi_mbar:.12g}'],
+            ['Rows sampled', str(sample_count)],
+            ['Measured pressure model', 'N2-calibrated indicated pressure from current heat-flow model'],
+            [],
+            [f'real_pressure_{unit_label}', f'measured_pressure_{unit_label}',
+             f'delta_pressure_{unit_label}', 'delta_percent'],
+        ]
+
+        for real_pa, measured_pa in zip(real_pressures_pa, measured_pressures_pa):
+            delta_pa = measured_pa - real_pa
+            delta_pct = (delta_pa / max(real_pa, 1e-20)) * 100.0
+            rows.append([
+                f'{real_pa * unit_factor:.12g}',
+                f'{measured_pa * unit_factor:.12g}',
+                f'{delta_pa * unit_factor:.12g}',
+                f'{delta_pct:.12g}',
+            ])
+        return rows
 
     # ── Molecule initialisation ──────────────────────────────────────────────
 
@@ -3314,9 +4973,14 @@ class MolecularSimTab(ttk.Frame):
             self.mol_pos = np.zeros((0, 3))
             self.mol_vel = np.zeros((0, 3))
         self.mol_gas_keys = all_keys
+        self.mol_gas_key_array = np.asarray(all_keys, dtype=object)
 
         # Precompute per-molecule accommodation & (f+1) for vectorised _step
         n = len(self.mol_gas_keys)
+        self.mol_group_indices = {}
+        if n > 0:
+            for gas_key in dict.fromkeys(all_keys):
+                self.mol_group_indices[gas_key] = np.flatnonzero(self.mol_gas_key_array == gas_key)
         self.mol_aE = np.empty(n, dtype=np.float64)
         self.mol_f_plus1 = np.empty(n, dtype=np.float64)
         for j, gk in enumerate(self.mol_gas_keys):
@@ -3325,20 +4989,17 @@ class MolecularSimTab(ttk.Frame):
 
         # Thermal speed scale at T_COLD for wall re-thermalization
         self.mol_thermal_speed = np.empty(n, dtype=np.float64)
+        self.mol_conv_response = np.empty(n, dtype=np.float64)
         for j, gk in enumerate(self.mol_gas_keys):
             gas = GAS_DATA[gk]
             speed = self.MOL_SPEED_BASE * (gas['cbar'] / GAS_DATA['N2']['cbar'])
             self.mol_thermal_speed[j] = speed * 0.65 * math.sqrt(self.T_COLD / 296.0)
+            self.mol_conv_response[j] = self._get_visual_convection_response(gk)
 
-        if n > 0:
-            p_target = 10 ** self.sl_pressure.get()
-            V = self._get_defined_volume_m3()
-            self.molecules_per_particle = max(
-                (p_target * V) / (kB * self.T_COLD * n),
-                1.0,
-            )
-        else:
-            self.molecules_per_particle = self.MOLECULES_PER_PARTICLE
+        # Gas starts in thermal equilibrium with the enclosure walls.
+        self.gas_ambient_temp_k = self.T_COLD
+        self.wall_coupling_ema = 0.0
+        self._sync_molecule_scale_to_pressure_setpoint()
 
         if n > 0:
             temp_now = self._estimate_particle_temperatures_k()
@@ -3347,10 +5008,6 @@ class MolecularSimTab(ttk.Frame):
         else:
             self.mol_trail_pos = np.zeros((0, self.TRAIL_LENGTH, 3))
             self.mol_trail_temp = np.zeros((0, self.TRAIL_LENGTH))
-        # Gas starts in thermal equilibrium with the enclosure walls
-        self.gas_ambient_temp_k = self.T_COLD
-        self.wall_coupling_ema = 0.0
-
         self._step_cooling_accum = 0.0
         self.collision_signal_ema = 0.0
         self.sensor_samples = 0
@@ -3397,7 +5054,8 @@ class MolecularSimTab(ttk.Frame):
         """Advance one simulation timestep using vectorised NumPy operations
         for position integration, boundary reflection, and collision handling."""
         dt = self.DT
-        geometry = GAUGE_CONFIGS[self.cfg_var.get()]['geometry']
+        cfg = GAUGE_CONFIGS[self.cfg_var.get()]
+        geometry = cfg['geometry']
         is_plate = geometry == 'plates'
         is_square = geometry == 'square_cavity'
         seg_dz = self.L_WIRE / self.N_SEG
@@ -3410,16 +5068,17 @@ class MolecularSimTab(ttk.Frame):
         vel = self.mol_vel
 
         # ── Gravity/buoyancy forcing (global z convection direction) ──
-        p_mbar = convert_pressure(10 ** self.sl_pressure.get(), 'mbar')
-        p_on = max(self.CONVECTION_P_ON_MBAR, 1e-9)
-        x_conv = (p_mbar / p_on) ** self.CONVECTION_TRANSITION_N
-        conv_activation = x_conv / (1.0 + x_conv)
-        if conv_activation > 1e-6:
+        p_pa = 10 ** self.sl_pressure.get()
+        conv_activation = float(_convection_pressure_activation(cfg, p_pa))
+        gravity_scale = _effective_gravity(cfg) / max(G_STD, 1e-12)
+        if conv_activation > 1e-6 and gravity_scale > 0.0:
             g_axis = 0 if self._is_horizontal_wire_mode() else 2
             t_mol = self._estimate_particle_temperatures_k()
             temp_drive = np.clip((t_mol - self.T_COLD) / max(self.T_HOT - self.T_COLD, 1.0), 0.0, 2.0)
-            buoy = conv_activation * self.BUOYANCY_ACCEL * temp_drive
-            vel[:, g_axis] += (self.GRAVITY_ACCEL + buoy) * dt
+            response = self.mol_conv_response[:n] if len(self.mol_conv_response) >= n else 1.0
+            buoy = (conv_activation * self.BUOYANCY_ACCEL * gravity_scale *
+                    _convection_geometry_factor(cfg) * temp_drive * response)
+            vel[:, g_axis] += (self.GRAVITY_ACCEL * gravity_scale + buoy) * dt
             # Keep forcing numerically stable at high pressures/speeds.
             vcap = np.maximum(2.5 * self.mol_thermal_speed[:n], 0.8)
             vel[:, g_axis] = np.clip(vel[:, g_axis], -vcap, vcap)
@@ -3627,6 +5286,25 @@ class MolecularSimTab(ttk.Frame):
             return self.T_COLD
         return float(np.clip(self.gas_ambient_temp_k, self.T_COLD, self.T_HOT + 140.0))
 
+    def _get_pressure_setpoint_pa(self):
+        """Current pressure setpoint from the log-pressure slider."""
+        return max(float(10 ** self.sl_pressure.get()), 1e-20)
+
+    def _sync_molecule_scale_to_pressure_setpoint(self):
+        """Keep represented molecule count consistent with the pressure setpoint."""
+        n_visual = len(self.mol_pos)
+        if n_visual <= 0:
+            self.molecules_per_particle = self.MOLECULES_PER_PARTICLE
+            return
+
+        volume_m3 = self._get_defined_volume_m3()
+        temperature_k = max(self._get_gas_ambient_temperature_k(), 1.0)
+        target_pressure_pa = self._get_pressure_setpoint_pa()
+        self.molecules_per_particle = max(
+            (target_pressure_pa * volume_m3) / (kB * temperature_k * n_visual),
+            1.0,
+        )
+
     def _update_particle_trails(self):
         """Append the latest molecule positions and temperatures to trail history."""
         n = len(self.mol_pos)
@@ -3674,8 +5352,12 @@ class MolecularSimTab(ttk.Frame):
         segments = []
         colors = []
         denom = max(self.TRAIL_LENGTH - 1, 1)
+        trail_indices = np.arange(n)
+        if n > self.MAX_TRAIL_PARTICLES:
+            stride = int(math.ceil(n / self.MAX_TRAIL_PARTICLES))
+            trail_indices = trail_indices[::stride]
 
-        for j in range(n):
+        for j in trail_indices:
             pts = self.mol_trail_pos[j]
             temps = self.mol_trail_temp[j]
             for i in range(1, self.TRAIL_LENGTH):
@@ -3747,10 +5429,10 @@ class MolecularSimTab(ttk.Frame):
         self.total_energy_transferred += total_cool
         self._step_cooling_accum += total_cool
 
-        # Count per-gas collisions
-        for gk in set(self.mol_gas_keys[j] for j in mi):
-            count = int(np.sum(np.array([self.mol_gas_keys[j] for j in mi]) == gk))
-            self.collision_per_gas[gk] = self.collision_per_gas.get(gk, 0) + count
+        if len(self.mol_gas_key_array) >= len(self.mol_gas_keys):
+            hit_keys, hit_counts = np.unique(self.mol_gas_key_array[mi], return_counts=True)
+            for gk, count in zip(hit_keys, hit_counts):
+                self.collision_per_gas[gk] = self.collision_per_gas.get(gk, 0) + int(count)
 
     def _thermalize_at_wall(self, mask):
         """Re-sample molecule speeds to Maxwell–Boltzmann at T_COLD.
@@ -3859,32 +5541,43 @@ class MolecularSimTab(ttk.Frame):
                 if self.show_temp_trails.get():
                     self._draw_temperature_trails(ax, cmap, tnorm)
 
-                gas_groups = {}
-                for j, gk in enumerate(self.mol_gas_keys):
-                    gas_groups.setdefault(gk, []).append(j)
-
-                for gk, indices in gas_groups.items():
+                for gk, idx in self.mol_group_indices.items():
                     gas = GAS_DATA[gk]
-                    idx = np.array(indices)
-                    sz = self.MOL_SIZE_BASE * (self.MOL_RADII[gk] / self.MOL_RADII['N2']) ** 2
+                    sz = self.MOL_SIZE_BASE * (self._get_molecule_radius_pm(gk) / self.MOL_RADII['N2']) ** 2
                     mx, my, mz = self._render_coords(self.mol_pos[idx, 0],
                                                      self.mol_pos[idx, 1],
                                                      self.mol_pos[idx, 2])
                     ax.scatter(mx, my, mz,
-                               s=sz, c=gas['color'], alpha=0.85,
-                               edgecolors='white', linewidths=0.4,
-                               depthshade=True, zorder=5, label=gas['symbol'])
+                               s=sz, c=gas['color'], alpha=0.78,
+                               edgecolors='none', linewidths=0,
+                               depthshade=False, zorder=5, label=gas['symbol'])
+
+                if self.show_center_of_mass.get():
+                    self._draw_center_of_mass_regions(ax)
 
                 if self.show_vectors.get():
-                    for j in range(len(self.mol_pos)):
+                    vector_indices = np.arange(len(self.mol_pos))
+                    if len(vector_indices) > self.MAX_VECTOR_PARTICLES:
+                        stride = int(math.ceil(len(vector_indices) / self.MAX_VECTOR_PARTICLES))
+                        vector_indices = vector_indices[::stride]
+                    segments = []
+                    colors = []
+                    for j in vector_indices:
                         gk = self.mol_gas_keys[j] if j < len(self.mol_gas_keys) else 'N2'
                         p = self.mol_pos[j]
                         v = self.mol_vel[j] * 0.25
                         p0x, p0y, p0z = self._render_coords(p[0], p[1], p[2])
                         p1x, p1y, p1z = self._render_coords(p[0] + v[0], p[1] + v[1], p[2] + v[2])
-                        ax.plot([float(p0x), float(p1x)], [float(p0y), float(p1y)],
-                                [float(p0z), float(p1z)], color=GAS_DATA[gk]['color'],
-                                alpha=0.45, linewidth=0.7)
+                        segments.append([[float(p0x), float(p0y), float(p0z)],
+                                         [float(p1x), float(p1y), float(p1z)]])
+                        colors.append(mcolors.to_rgba(GAS_DATA[gk]['color'], 0.45))
+                    if segments:
+                        ax.add_collection3d(art3d.Line3DCollection(
+                            segments,
+                            colors=colors,
+                            linewidths=0.7,
+                            zorder=4,
+                        ))
 
             # Axes setup
             lim = self.R_ENC * 1.1
@@ -3953,9 +5646,90 @@ class MolecularSimTab(ttk.Frame):
 
             ax.view_init(elev=self._elev, azim=self._azim)
 
-        self.fig.tight_layout()
+        self.fig.subplots_adjust(left=0.02, right=0.98, bottom=0.02, top=0.94)
         self.canvas.draw_idle()
         self._update_stats()
+
+    def _draw_center_of_mass_regions(self, ax):
+        """Draw realtime center-of-mass halos for each active gas species."""
+        if len(self.mol_pos) == 0:
+            return
+
+        azimuth = np.linspace(0.0, 2.0 * np.pi, 18)
+        polar = np.linspace(0.0, np.pi, 9)
+        sin_polar = np.sin(polar)[:, np.newaxis]
+        cos_polar = np.cos(polar)[:, np.newaxis]
+        cos_azimuth = np.cos(azimuth)[np.newaxis, :]
+        sin_azimuth = np.sin(azimuth)[np.newaxis, :]
+
+        for gas_key, indices in self.mol_group_indices.items():
+            valid_indices = np.asarray(indices, dtype=np.intp)
+            valid_indices = valid_indices[valid_indices < len(self.mol_pos)]
+            if valid_indices.size == 0:
+                continue
+
+            gas = GAS_DATA.get(gas_key, GAS_DATA['N2'])
+            positions = self.mol_pos[valid_indices]
+            mass_weight = max(float(gas.get('m', GAS_DATA['N2']['m'])), 1e-12)
+            weights = np.full(valid_indices.size, mass_weight, dtype=np.float64)
+            center = np.average(positions, axis=0, weights=weights)
+            centered = positions - center
+            spread = np.sqrt(np.average(np.einsum('ij,ij->i', centered, centered), weights=weights))
+            radius = float(np.clip(0.32 + 0.18 * spread, 0.42, 1.05))
+
+            center_x, center_y, center_z = self._render_coords(center[0], center[1], center[2])
+            center_x = float(center_x)
+            center_y = float(center_y)
+            center_z = float(center_z)
+
+            sphere_x = center_x + radius * sin_polar * cos_azimuth
+            sphere_y = center_y + radius * sin_polar * sin_azimuth
+            sphere_z = center_z + radius * cos_polar * np.ones_like(cos_azimuth)
+            color = gas.get('color', COLORS['accent'])
+
+            ax.plot_surface(
+                sphere_x,
+                sphere_y,
+                sphere_z,
+                color=color,
+                alpha=0.13,
+                linewidth=0,
+                shade=False,
+                zorder=3,
+            )
+            ax.plot_wireframe(
+                sphere_x,
+                sphere_y,
+                sphere_z,
+                color=color,
+                alpha=0.26,
+                linewidth=0.45,
+                rstride=2,
+                cstride=3,
+                zorder=4,
+            )
+
+            cross_radius = radius * 0.78
+            ax.plot([center_x - cross_radius, center_x + cross_radius],
+                    [center_y, center_y], [center_z, center_z],
+                    color=color, alpha=0.58, linewidth=1.0, zorder=6)
+            ax.plot([center_x, center_x], [center_y - cross_radius, center_y + cross_radius],
+                    [center_z, center_z], color=color, alpha=0.58, linewidth=1.0, zorder=6)
+            ax.plot([center_x, center_x], [center_y, center_y],
+                    [center_z - cross_radius, center_z + cross_radius],
+                    color=color, alpha=0.58, linewidth=1.0, zorder=6)
+
+            ax.scatter([center_x], [center_y], [center_z],
+                       s=82, c=[color], marker='P',
+                       edgecolors=COLORS['text_bright'], linewidths=0.9,
+                       depthshade=False, zorder=7)
+            ax.text(center_x, center_y, center_z + radius * 1.16,
+                    f"{gas.get('symbol', gas_key)} COM",
+                    color=COLORS['text_bright'], fontsize=7.5,
+                    ha='center', va='center', zorder=8,
+                    bbox=dict(boxstyle='round,pad=0.22',
+                              facecolor=color, edgecolor=COLORS['bg_card'],
+                              alpha=0.78))
 
     def _draw_wire(self, ax, cmap, tnorm):
         """Render the cylindrical filament with per-segment temperature colour."""
@@ -4092,8 +5866,13 @@ class MolecularSimTab(ttk.Frame):
 
         represented_molecules = len(self.mol_pos) * self.molecules_per_particle
 
-        # Expected molecular-regime correction factor for current mixture
-        cf_mix = self._get_empirical_cf_mix(fracs)
+        cfg = self._get_active_sim_config()
+        cf_mix = calc_mixture_correction_factor_physics(
+            fracs,
+            cfg,
+            p_real,
+            aN2=self._get_nominal_aN2(cfg),
+        )
         acc_spec_label = self._pirani_accuracy_label(p_real)
 
         self.stats_label.config(text=(
@@ -4225,6 +6004,7 @@ class MolecularSimTab(ttk.Frame):
 
     def _on_config_change(self):
         cfg = GAUGE_CONFIGS.get(self.cfg_var.get(), {})
+        self._bridge_calibration_cache.clear()
         # Load sensor/bridge parameters from the selected gauge
         sensor = cfg.get('sensor', {})
         if sensor:
@@ -4281,6 +6061,7 @@ class MolecularSimTab(ttk.Frame):
         self.seg_temps = np.clip(self.seg_temps, self.T_COLD, self.T_HOT + 5)
         self._auto_update_color_range()
         self._sync_temperature_unit_display()
+        self._bridge_calibration_cache.clear()
         # Rebuild molecules after slider interaction settles for smoother UI.
         self._schedule_molecule_reinit(draw_if_idle=True, delay_ms=120)
         self._update_live_pressure()
@@ -4296,6 +6077,7 @@ class MolecularSimTab(ttk.Frame):
         # Reset filament to new equilibrium and re-init molecules
         self.seg_temps = np.full(self.N_SEG, self.T_HOT, dtype=np.float64)
         self._auto_update_color_range()
+        self._bridge_calibration_cache.clear()
         self._schedule_molecule_reinit(draw_if_idle=True, delay_ms=120)
         self._update_live_pressure()
 
@@ -4316,10 +6098,9 @@ class MolecularSimTab(ttk.Frame):
             self._draw_scene()
 
     def _get_default_color_window(self):
-        """Return a robust default color window tied to current cold/hot temperatures."""
-        span = max(self.T_HOT - self.T_COLD, 8.0)
-        cmin = self.T_COLD - max(4.0, 0.15 * span)
-        cmax = self.T_HOT + max(5.0, 0.25 * span)
+        """Return the auto color window centered on filament temperature ±3 °C."""
+        cmin = self.T_HOT - 3.0
+        cmax = self.T_HOT + 3.0
         cmin = float(np.clip(cmin, 180.0, 780.0))
         cmax = float(np.clip(cmax, cmin + 2.0, 800.0))
         return cmin, cmax
@@ -4461,6 +6242,7 @@ class MolecularSimTab(ttk.Frame):
 
     def _calc_real_pressure_pa(self):
         """Ideal-gas real pressure from molecule count in the defined volume."""
+        self._sync_molecule_scale_to_pressure_setpoint()
         n_real = len(self.mol_pos) * self.molecules_per_particle
         V = self._get_defined_volume_m3()
         t_gas = self._get_gas_ambient_temperature_k()
@@ -4513,10 +6295,12 @@ class MolecularSimTab(ttk.Frame):
         return eps * SIGMA_SB * A * max(t1 ** 4 - t2 ** 4, 0.0)
 
     def _calc_convection_loss_w(self, p_pa, t_hot_k, t_cold_k, cfg, fracs):
-        """Natural-convection loss, negligible below about 1e4 Pa."""
+        """Natural-convection loss from pressure, gas transport, gravity, and geometry."""
         p = max(float(p_pa), 0.0)
         dt = max(float(t_hot_k) - float(t_cold_k), 0.0)
-        if p < 1e4 or dt <= 0.0:
+        gravity = _effective_gravity(cfg)
+        activation = float(_convection_pressure_activation(cfg, p))
+        if p <= 0.0 or dt <= 0.0 or gravity <= 0.0 or activation <= 1e-9:
             return 0.0
 
         t_film = max(0.5 * (t_hot_k + t_cold_k), 180.0)
@@ -4540,25 +6324,23 @@ class MolecularSimTab(ttk.Frame):
         alpha = k_mix / max(rho * cp_mix, 1e-12)
         pr = float(np.clip(nu / max(alpha, 1e-12), 0.2, 8.0))
 
-        if cfg['geometry'] == 'plates':
-            l_char = max(float(cfg.get('gap', 1e-3)), 1e-6)
-        else:
-            r2 = float(cfg.get('enc_r', 8e-3))
-            r1 = float(cfg.get('wire_r', 5e-6))
-            l_char = max(r2 - r1, 1e-6)
+        l_char = _convection_characteristic_length(cfg)
 
         beta = 1.0 / t_film
-        ra = G_STD * beta * dt * (l_char ** 3) / max(nu * alpha, 1e-18)
+        ra = gravity * beta * dt * (l_char ** 3) / max(nu * alpha, 1e-18)
         ra = float(np.clip(ra, 0.0, 1e12))
-        nu_nat = 0.68 + (0.67 * (ra ** 0.25)) / ((1.0 + (0.492 / pr) ** (9.0 / 16.0)) ** (4.0 / 9.0))
-        h = max((nu_nat * k_mix) / l_char, 0.0)
+        nu_nat = _natural_convection_nusselt(ra, pr, cfg)
+        conv_strength = max(float(nu_nat) - 1.0, 0.0)
+        h = max((conv_strength * k_mix) / l_char, 0.0)
+        h *= activation * _convection_geometry_factor(cfg) * max(float(cfg.get('conv_gain', DEFAULT_CONVECTION_GAIN)), 0.0)
         A = self._get_sensor_hot_area_m2(cfg)
         return h * A * dt
 
     def _solve_electro_thermal_state(self, p_pa, fracs, use_n2_only=False):
         """Solve Qel(T)=Qgas(T,P)+Qsupport(T)+Qrad(T)+Qconv(T,P) for filament T."""
         cfg = dict(self._get_active_sim_config())
-        cfg['conv_gain'] = 0.0  # convection is accounted separately in Q_conv
+        gas_cfg = dict(cfg)
+        gas_cfg['conv_gain'] = 0.0  # convection is accounted separately in Q_conv
         t_cold = float(self.T_COLD)
         p = max(float(p_pa), 1e-20)
         aN2 = self._get_nominal_aN2(cfg)
@@ -4580,7 +6362,7 @@ class MolecularSimTab(ttk.Frame):
             for gk, x in mix.items():
                 q_g, _, _ = calc_heat_flow(
                     gk,
-                    cfg,
+                    gas_cfg,
                     p,
                     aN2=aN2,
                     t_hot_override=t_hot,
@@ -4616,7 +6398,7 @@ class MolecularSimTab(ttk.Frame):
 
         lo, hi = t_lo, t_hi
         state = None
-        for _ in range(56):
+        for _ in range(36):
             mid = 0.5 * (lo + hi)
             f_mid, q_gas, q_support, q_rad, q_conv, rs, q_el = residual(mid)
             state = (mid, f_mid, q_gas, q_support, q_rad, q_conv, rs, q_el)
@@ -4658,8 +6440,70 @@ class MolecularSimTab(ttk.Frame):
         state['v_out_v'] = float(v_out)
         return state
 
+    def _bridge_calibration_key(self):
+        cfg = self._get_active_sim_config()
+        sensor_state = (
+            self.sensor_t_ref_k,
+            self.sensor_r0_ohm,
+            self.sensor_tcr_per_k,
+            self.bridge_v_bias,
+            self.bridge_r1_ohm,
+            self.bridge_r2_ohm,
+            self.bridge_v_sensor,
+            self.sensor_emissivity,
+            self.sensor_support_lambda_wmk,
+            self.sensor_support_w_m,
+            self.sensor_support_t_m,
+            self.sensor_support_l_m,
+            self.sensor_extra_support_g_wpk,
+        )
+        return (_freeze_for_cache(cfg), _freeze_for_cache(sensor_state))
+
+    def _get_n2_bridge_calibration_table(self):
+        """Return cached monotonic Vout -> log(pressure) table for N2 calibration."""
+        key = self._bridge_calibration_key()
+        cached = self._bridge_calibration_cache.get(key)
+        if cached is not None:
+            return cached
+
+        pressures = np.logspace(-10, math.log10(2e6), 72)
+        volts = np.empty_like(pressures)
+        for idx, pressure in enumerate(pressures):
+            volts[idx] = self._bridge_output_for_pressure(
+                pressure,
+                {'N2': 1.0},
+                use_n2_only=True,
+            )['v_out_v']
+
+        valid = np.isfinite(volts)
+        if np.count_nonzero(valid) < 2:
+            table = (np.array([], dtype=np.float64), np.array([], dtype=np.float64))
+            _cache_put_bounded(self._bridge_calibration_cache, key, table, limit=12)
+            return table
+
+        volts = volts[valid]
+        log_pressures = np.log(pressures[valid])
+        order = np.argsort(volts)
+        volts = volts[order]
+        log_pressures = log_pressures[order]
+        unique = np.concatenate(([True], np.diff(volts) > 1e-12))
+        table = (volts[unique], log_pressures[unique])
+        _cache_put_bounded(self._bridge_calibration_cache, key, table, limit=12)
+        return table
+
     def _invert_n2_bridge_to_pressure(self, v_target):
         """Invert N2 bridge calibration curve to indicated pressure."""
+        volts, log_pressures = self._get_n2_bridge_calibration_table()
+        if len(volts) >= 2:
+            log_p = np.interp(
+                float(v_target),
+                volts,
+                log_pressures,
+                left=float(log_pressures[0]),
+                right=float(log_pressures[-1]),
+            )
+            return float(np.exp(log_p))
+
         p_lo = 1e-10
         p_hi = 2e6
         v_lo = self._bridge_output_for_pressure(p_lo, {'N2': 1.0}, use_n2_only=True)['v_out_v']
@@ -5028,6 +6872,8 @@ class PiraniSimulatorApp:
         "lambda       = mean free path (m)\n"
         "Kn           = Knudsen number = lambda / characteristic_length\n"
         "m            = molecular mass (amu in tables, kg in equations)\n"
+        "g            = effective gravitational acceleration used in buoyancy/convection terms\n"
+        "Ra / Pr / Nu = Rayleigh, Prandtl, and Nusselt numbers for natural-convection scaling\n"
         "\n"
         "Geometry terms\n"
         "r1           = wire radius (m)\n"
@@ -5143,6 +6989,8 @@ class PiraniSimulatorApp:
             self.notebook.add(tab, text=f" {label} ")
             self.tabs.append(tab)
 
+        register_gas_palette_listener(self._on_gas_palette_changed)
+
         APP_STATE['pressure_unit'].trace_add('write', self._on_global_units_changed)
         APP_STATE['temperature_unit'].trace_add('write', self._on_global_units_changed)
         APP_STATE['theme_mode'].trace_add('write', self._on_theme_changed)
@@ -5193,6 +7041,12 @@ class PiraniSimulatorApp:
     def _on_global_units_changed(self, *_):
         for tab in self.tabs:
             handler = getattr(tab, 'on_global_units_changed', None)
+            if callable(handler):
+                handler()
+
+    def _on_gas_palette_changed(self):
+        for tab in self.tabs:
+            handler = getattr(tab, 'on_gas_palette_changed', None)
             if callable(handler):
                 handler()
 

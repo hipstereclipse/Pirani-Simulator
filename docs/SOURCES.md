@@ -16,13 +16,26 @@ Used for:
 
 Fundamental constants used in code (for example Boltzmann and Stefan-Boltzmann constants) follow standard SI/NIST values.
 
+## Imported Gas Data
+
+The simulator can import additional gases from governmental or intergovernmental data services. It checks NIST first and then falls back to other trusted sources when a record is too sparse for simulation:
+
+- NIST Chemistry WebBook, SRD 69, https://webbook.nist.gov/chemistry/
+- PubChem PUG REST, U.S. National Library of Medicine / NIH, https://pubchem.ncbi.nlm.nih.gov/docs/pug-rest
+- IAEA LiveChart of Nuclides, International Atomic Energy Agency, https://nds.iaea.org/relnsd/vcharthtml/VChartHTML.html
+
+For imported gases, the app uses source formula and molecular-weight values directly. Derived simulator fields such as degrees of freedom, heat-capacity ratio, mean thermal speed, mean-free-path product, and room-temperature transport estimates are calculated or estimated inside the simulator so the gas can participate in Pirani heat-transfer visualization. The custom gas palette popup shows the source attached to each property and can open the selected source directly.
+
 ## Simulator Presets and Engineering Assumptions
 
 Several values in the implementation are practical modeling assumptions intended to keep the simulation numerically stable and educationally useful across a large dynamic range. These include:
 
 - gauge geometry presets,
 - smooth bridging coefficients for molecular-to-viscous transition,
-- convection scaling terms,
+- gravity, gas-property, geometry, and orientation scaling terms for high-pressure natural convection,
+- Imported-gas fallback estimates for Pirani-specific gas fields not present in source records,
+- visual-particle scaling in the Molecular Sim tab, where each rendered particle represents many molecules and is synchronized to the pressure setpoint using the ideal gas law,
+- center-of-mass highlights for gas species, which are realtime visualization aids derived from current rendered particle positions,
 - UI-oriented defaults and range limits.
 
 These assumptions are not direct measurements from a single calibrated instrument and should be interpreted as model parameters.
